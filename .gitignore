@@ -1,0 +1,4 @@
+# Build output
+backup.elf
+tests/host/backup_host_test
+tests/run/

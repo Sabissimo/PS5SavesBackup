@@ -2,7 +2,7 @@
  * A missing/invalid cache causes a safe recopy, never a content-hash shortcut. */
 #ifndef CHANGE_INDEX_H
 #define CHANGE_INDEX_H
-#define INDEX_PATH BACKUP_ROOT "/.ps5save-index"
+#define INDEX_NAME ".ps5save-index"
 #define INDEX_LIMIT 100000
 #define INDEX_BUCKETS 4096
 
@@ -19,6 +19,14 @@ typedef struct change_record {
 static change_record_t *change_index[INDEX_BUCKETS];
 static unsigned index_count;
 static int index_dirty;
+
+/* <backup root>/.ps5save-index plus an optional suffix such as ".part". */
+static const char *
+index_path(const char *suffix) {
+  static char path[PATH_MAX];
+  snprintf(path, sizeof path, "%s/" INDEX_NAME "%s", g_backup_root, suffix);
+  return path;
+}
 
 static file_signature_t
 file_signature(const struct stat *st) {
@@ -95,7 +103,7 @@ index_update(const char *dst, const struct stat *src) {
 static void
 index_load(void) {
   index_clear();
-  FILE *f = fopen(INDEX_PATH, "rb");
+  FILE *f = fopen(index_path(""), "rb");
   if(!f) return;
   char magic[8];
   int valid = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "PS5IDX2\n", 8);
@@ -110,7 +118,7 @@ index_load(void) {
        fread(&source, 1, sizeof source, f) != sizeof source ||
        fread(&target, 1, sizeof target, f) != sizeof target) {valid = 0; break;}
     path[len] = 0;
-    if(strlen(path) != len || strncmp(path, BACKUP_ROOT "/", strlen(BACKUP_ROOT) + 1)) {valid = 0; break;}
+    if(strlen(path) != len || !path_within(path, g_backup_root) || !strcmp(path, g_backup_root)) {valid = 0; break;}
     change_record_t *r = index_record(path, 1);
     if(!r) {valid = 0; break;}
     r->source = source; r->target = target;
@@ -122,7 +130,7 @@ index_load(void) {
 static void
 index_save(void) {
   if(!index_dirty) return;
-  FILE *f = fopen(INDEX_PATH ".part", "wb");
+  FILE *f = fopen(index_path(".part"), "wb");
   if(!f) {logq("Cannot save change cache; next pass may recopy files"); return;}
   int ok = fwrite("PS5IDX2\n", 1, 8, f) == 8;
   for(unsigned i = 0; i < INDEX_BUCKETS && ok; i++) {
@@ -136,8 +144,10 @@ index_save(void) {
   }
   if(fflush(f) || fsync(fileno(f))) ok = 0;
   if(fclose(f)) ok = 0;
-  if(!ok || rename(INDEX_PATH ".part", INDEX_PATH)) {
-    unlink(INDEX_PATH ".part"); logq("Cannot commit change cache");
+  char part[PATH_MAX];
+  snprintf(part, sizeof part, "%s", index_path(".part"));
+  if(!ok || rename(part, index_path(""))) {
+    unlink(part); logq("Cannot commit change cache");
   } else index_dirty = 0;
 }
 #endif
