@@ -8,7 +8,7 @@ LDLIBS := -lSceFsInternalForVsh -lSceNotification -lpthread
 
 all: backup.elf
 
-backup.elf: main.c notification_icon.h backup_progress.h title_activity.h change_index.h
+backup.elf: main.c notification_icon.h backup_progress.h title_activity.h change_index.h usb_storage.h
 	$(CC) $(CFLAGS) main.c $(LDLIBS) -o $@
 
 .PHONY: all clean

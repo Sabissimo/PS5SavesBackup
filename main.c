@@ -17,8 +17,14 @@ along with this program; see the file COPYING. If not, see
 /**
  * Save backup daemon for PS5.
  *
- * Reads /mnt/usb0/backup.conf and copies the listed files to
- * /mnt/usb0/backup/<original path>:
+ * At startup the /mnt/usb<N> mount points are scanned in numerical order and
+ * the first one whose root holds a readable backup.conf is selected (see
+ * usb_storage.h). That USB is used for everything below; <usb> stands for it
+ * (for example /mnt/usb2). There is no fallback to /mnt/usb0: without a
+ * backup.conf the payload reports an error and exits.
+ *
+ * Reads <usb>/backup.conf and copies the listed files to
+ * <usb>/backup/<original path>:
  *
  *   /data/PCSX2/Mcd001.ps2        one file
  *   /data/porpoise/saves/<star>   every file and folder below, recursively
@@ -29,7 +35,7 @@ along with this program; see the file COPYING. If not, see
  *                                  in decimal MB; default 4096 = 4.096GB
  *   daily_snapshots_to_keep=3       keep a dated snapshot (a copy of the live
  *                                 backup) of the newest N days in
- *                                 /mnt/usb0/backup_daily/YYYY-MM-DD, using the
+ *                                 <usb>/backup_daily/YYYY-MM-DD, using the
  *                                 console's local date. 0..10, default 0 = off.
  *                                 The first run on a date creates its snapshot
  *                                 and it is never overwritten that day; it is
@@ -45,7 +51,7 @@ along with this program; see the file COPYING. If not, see
  *
  * PS4/PS5 saves are encrypted images. For each image that changed, a COPY of
  * the image is mounted (the original is only ever read), the decrypted files
- * are copied to /mnt/usb0/backup/saves/..., and the image is unmounted again.
+ * are copied to <usb>/backup/saves/..., and the image is unmounted again.
  * A title is deferred while that same title is running, suspended or still
  * sandbox-mounted. Other titles may be backed up during gameplay. Activity is
  * checked before mounting and during copying; unknown activity fails closed.
@@ -96,9 +102,6 @@ along with this program; see the file COPYING. If not, see
 #include <ps5/klog.h>
 
 
-#ifndef USB_ROOT
-#define USB_ROOT      "/mnt/usb0"
-#endif
 #ifndef HOME_ROOT
 #define HOME_ROOT     "/user/home"
 #endif
@@ -112,9 +115,8 @@ along with this program; see the file COPYING. If not, see
 #define PFSMGR_DEV    "/dev/pfsmgr"
 #endif
 
-#define CONF_PATH     USB_ROOT "/backup.conf"
-#define BACKUP_ROOT   USB_ROOT "/backup"
-#define DAILY_ROOT    USB_ROOT "/backup_daily"
+/* The USB root, backup.conf, backup/ and backup_daily/ paths are selected at
+ * run time: g_usb_root, g_conf_path, g_backup_root, g_daily_root. */
 #define MAX_DAILY     10      /* highest value for daily_snapshots_to_keep= */
 #define MAX_DAILY_DIRS 1024   /* date folders looked at when pruning */
 #define TMP_IMG       TMP_DIR "/_backup_tmp_image"
@@ -561,7 +563,9 @@ fs_free(const char *path, const char *test_env) {
 }
 
 
-#define usb_free()   fs_free(USB_ROOT, "TEST_USB_FREE")
+#include "usb_storage.h"
+
+#define usb_free()   fs_free(g_usb_root, "TEST_USB_FREE")
 #define data_free()  fs_free(TMP_DIR, "TEST_DATA_FREE")
 
 
@@ -653,7 +657,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
             backup_stats_t *stats) {
   char tmp[PATH_MAX];
   char dir[PATH_MAX];
-  const char *label = dst + strlen(BACKUP_ROOT);
+  const char *label = dst + strlen(g_backup_root);
   struct stat after;
   struct timeval tv[2];
   char *slash;
@@ -687,6 +691,13 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     return;
   }
 
+  /* the USB may have been unplugged: never write to its empty mount point */
+  usb_watch();
+  if(g_usb_lost) {
+    stats->failed++;
+    return;
+  }
+
   tmp[0] = 0;
   if(snprintf(tmp, sizeof tmp, "%s.part", dst) >= (int)sizeof tmp) {
     tmp[0] = 0;
@@ -707,10 +718,16 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     return;
   }
 
+  /* last check before anything is created on the USB */
+  if(!usb_online()) {
+    goto done;
+  }
+
   snprintf(dir, sizeof dir, "%s", dst);
   if((slash = strrchr(dir, '/')) && slash != dir) {
     *slash = 0;
     if(mkdir_p(dir)) {
+      usb_online();
       goto done;
     }
   }
@@ -735,6 +752,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
         if(errno == EINTR) {
           continue;
         }
+        usb_online();
         goto done;
       }
       progress_advance(w);
@@ -745,6 +763,10 @@ backup_file(const char *src, const char *dst, const struct stat *st,
       game_watch();
       if(g_watch_game && g_game_abort) {
         aborted = 1;
+        goto done;
+      }
+      usb_watch();
+      if(g_usb_lost) {
         goto done;
       }
     }
@@ -758,10 +780,12 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     goto done;
   }
   if(fsync(out)) {
+    usb_online();
     goto done;
   }
   if(close(out)) {
     out = -1;
+    usb_online();
     goto done;
   }
   out = -1;
@@ -773,6 +797,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
   utimes(tmp, tv);
 
   if(rename(tmp, dst)) {
+    usb_online();
     goto done;
   }
 
@@ -796,7 +821,9 @@ done:
       unlink(tmp);
     }
     if(!aborted) {
-      logq("Failed to backup %s", label);
+      if(!g_usb_lost) {
+        logq("Failed to backup %s", label);
+      }
       stats->failed++;
     }
   }
@@ -815,12 +842,12 @@ backup_tree(const char *src, const char *dst, backup_stats_t *stats) {
   DIR *dir;
 
   if(!(dir = opendir(src))) {
-    logq("Failed to backup %s", dst + strlen(BACKUP_ROOT));
+    logq("Failed to backup %s", dst + strlen(g_backup_root));
     stats->failed++;
     return;
   }
 
-  while((dp = readdir(dir)) && !(g_watch_game && g_game_abort)) {
+  while((dp = readdir(dir)) && !(g_watch_game && g_game_abort) && !g_usb_lost) {
     if(!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")) {
       continue;
     }
@@ -836,6 +863,13 @@ backup_tree(const char *src, const char *dst, backup_stats_t *stats) {
     }
 
     if(S_ISDIR(st.st_mode)) {
+      /* the backup USB seen through another path: never copy it into itself */
+      if(is_usb_root_dir(&st)) {
+        if(!g_progress_planning && !seen_before(spath)) {
+          logq("Skipping %s: it is the backup USB %s", spath, g_usb_root);
+        }
+        continue;
+      }
       backup_tree(spath, dpath, stats);
     } else if(S_ISREG(st.st_mode)) {
       backup_file(spath, dpath, &st, stats);
@@ -926,7 +960,7 @@ enough_space(uint64_t need) {
 static void
 save_dst_dir(char *out, size_t len, int ps5, const char *uid,
              const char *title, const char *save) {
-  snprintf(out, len, "%s/saves/%s/%s/%s/%s", BACKUP_ROOT,
+  snprintf(out, len, "%s/saves/%s/%s/%s/%s", g_backup_root,
            ps5 ? "ps5" : "ps4", uid, title, save);
 }
 
@@ -1122,10 +1156,17 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
 
   snprintf(image, sizeof image, "%s/%s", tdir, name);
   save_dst_dir(dst_dir, sizeof dst_dir, ps5, uid, title, save);
-  snprintf(label, sizeof label, "%s", dst_dir + strlen(BACKUP_ROOT));
+  snprintf(label, sizeof label, "%s", dst_dir + strlen(g_backup_root));
 
   if(stat(image, &ist) || !S_ISREG(ist.st_mode)) {
     return SV_SKIP;
+  }
+
+  /* nothing is staged or mounted once the USB is gone */
+  usb_watch();
+  if(g_usb_lost) {
+    stats->failed++;
+    return SV_FAILED;
   }
 
   /* nothing new since the last backup: no need to mount anything */
@@ -1281,7 +1322,7 @@ cleanup:
   progress_finish();
   g_progress_image = 0;
 
-  if(result == SV_OK) {
+  if(result == SV_OK && usb_online()) {
     stamp_write(dst_dir, &ist);
   } else if(result == SV_FAILED) {
     logq("Failed to backup %s", label);
@@ -1350,7 +1391,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
     return;
   }
 
-  while((td = readdir(bd)) && !g_mount_stuck) {
+  while((td = readdir(bd)) && !g_mount_stuck && !g_usb_lost) {
     char tdir[PATH_MAX];
     char tlabel[PATH_MAX];
     char dst_dir[PATH_MAX];
@@ -1495,7 +1536,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
 
     /* pass 2: back up only this safe title; other titles remain independent. */
     int complete = 1;
-    for(int i = 0; i < n && !g_mount_stuck; i++) {
+    for(int i = 0; i < n && !g_mount_stuck && !g_usb_lost; i++) {
       if(!imgs[i].needed) {
         stats->unchanged++;
         continue;
@@ -1540,7 +1581,7 @@ backup_saves(backup_stats_t *stats) {
   }
 
   if((hd = opendir(HOME_ROOT))) {
-    while((ud = readdir(hd)) && !g_mount_stuck) {
+    while((ud = readdir(hd)) && !g_mount_stuck && !g_usb_lost) {
       if(!is_hex_name(ud->d_name)) {
         continue;
       }
@@ -1673,12 +1714,20 @@ backup_entry(char *line, backup_stats_t *stats) {
     }
   }
 
-  /* never back up the backup itself */
-  if(!strncmp(line, USB_ROOT, strlen(USB_ROOT))) {
+  /* never back up the backup itself: nothing on the selected USB, and no
+   * path that contains its mount point ("/", "/mnt", "..", ...) */
+  if(source_overlaps_usb(line)) {
+    if(!g_progress_planning && !seen_before(line)) {
+      logq("Refusing to back up %s: it contains the backup USB %s", line, g_usb_root);
+    }
     return;
   }
 
-  if(snprintf(dst, sizeof dst, "%s%s", BACKUP_ROOT, line) >= (int)sizeof dst) {
+  if(g_usb_lost) {
+    return;
+  }
+
+  if(snprintf(dst, sizeof dst, "%s%s", g_backup_root, line) >= (int)sizeof dst) {
     return;
   }
 
@@ -1700,7 +1749,7 @@ backup_entry(char *line, backup_stats_t *stats) {
  * Daily snapshots (daily_snapshots_to_keep=N)
  *
  * A snapshot is a copy of the live backup folder, stored as
- * /mnt/usb0/backup_daily/YYYY-MM-DD (console local date). The first run on a
+ * <usb>/backup_daily/YYYY-MM-DD (console local date). The first run on a
  * given date creates it and it is never touched again that day. Only the N
  * newest date folders are kept.
  * ---------------------------------------------------------------------- */
@@ -1848,11 +1897,16 @@ copy_file_keep_time(const char *src, const char *dst, const struct stat *st) {
         if(errno == EINTR) {
           continue;
         }
+        usb_online();
         goto done;
       }
       progress_advance(w);
       p += w;
       n -= w;
+    }
+    usb_watch();
+    if(g_usb_lost) {
+      goto done;
     }
   }
   if(n == 0) {
@@ -1896,6 +1950,11 @@ copy_tree(const char *src, const char *dst, uint64_t *bytes) {
 
   while((dp = readdir(dir)) && !rc) {
     size_t len = strlen(dp->d_name);
+
+    if(!usb_online()) {
+      rc = -1;
+      break;
+    }
 
     if(!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")) {
       continue;
@@ -1951,7 +2010,7 @@ daily_prune(const char *today) {
 
   names = malloc((size_t)MAX_DAILY_DIRS * sizeof *names);
   stale = malloc((size_t)MAX_DAILY_DIRS * sizeof *stale);
-  if(!names || !stale || !(dir = opendir(DAILY_ROOT))) {
+  if(!names || !stale || !(dir = opendir(g_daily_root))) {
     free(names);
     free(stale);
     return;
@@ -1959,7 +2018,7 @@ daily_prune(const char *today) {
 
   /* collect first, delete afterwards (never modify a directory while reading it) */
   while((dp = readdir(dir))) {
-    if(snprintf(path, sizeof path, "%s/%s", DAILY_ROOT, dp->d_name) >= (int)sizeof path) {
+    if(snprintf(path, sizeof path, "%s/%s", g_daily_root, dp->d_name) >= (int)sizeof path) {
       continue;
     }
     if(is_date_part_name(dp->d_name)) {
@@ -1975,7 +2034,7 @@ daily_prune(const char *today) {
   closedir(dir);
 
   for(int i = 0; i < ns; i++) {
-    snprintf(path, sizeof path, "%s/%s", DAILY_ROOT, stale[i]);
+    snprintf(path, sizeof path, "%s/%s", g_daily_root, stale[i]);
     remove_tree(path);
   }
 
@@ -1985,7 +2044,7 @@ daily_prune(const char *today) {
     if(!strcmp(names[i], today)) {
       continue;
     }
-    snprintf(path, sizeof path, "%s/%s", DAILY_ROOT, names[i]);
+    snprintf(path, sizeof path, "%s/%s", g_daily_root, names[i]);
     if(!remove_tree(path)) {
       logq("Daily backup %s deleted (keeping newest %d)", names[i], g_daily);
       notify("Old daily snapshot removed.");
@@ -2023,7 +2082,7 @@ daily_check(void) {
 
   local_clock(wall_clock(), &ci);
   format_offset(ci.offset_min, tz, sizeof tz);
-  snprintf(final, sizeof final, "%s/%s", DAILY_ROOT, ci.date);
+  snprintf(final, sizeof final, "%s/%s", g_daily_root, ci.date);
   snprintf(part, sizeof part, "%s.part", final);
 
   /* one snapshot per date: an existing one is never wiped or refreshed */
@@ -2032,12 +2091,12 @@ daily_check(void) {
     return;
   }
 
-  if(stat(BACKUP_ROOT, &st) || !S_ISDIR(st.st_mode)) {
+  if(stat(g_backup_root, &st) || !S_ISDIR(st.st_mode)) {
     logq("Daily backup %s skipped: no live backup to copy yet", ci.date);
     return;
   }
 
-  need = dir_size(BACKUP_ROOT) + SPACE_MARGIN;
+  need = dir_size(g_backup_root) + SPACE_MARGIN;
   if(usb_free() < need) {
     snprintf(key, sizeof key, "daily-space:%s", ci.date);
     if(!seen_before(key)) {
@@ -2052,12 +2111,12 @@ daily_check(void) {
 
   progress_begin(need - SPACE_MARGIN);
   backup_activity_begin();
-  mkdir_p(DAILY_ROOT);
+  mkdir_p(g_daily_root);
   remove_tree(part);                     /* leftover of an interrupted copy */
 
   /* copy into a .part folder and rename at the end, so an interrupted copy is
    * never mistaken for a finished snapshot */
-  if(copy_tree(BACKUP_ROOT, part, &bytes) || (sync(), rename(part, final))) {
+  if(copy_tree(g_backup_root, part, &bytes) || (sync(), rename(part, final))) {
     progress_finish();
     remove_tree(part);
     snprintf(key, sizeof key, "daily-fail:%s", ci.date);
@@ -2108,11 +2167,17 @@ run_cycle(int pending_only) {
   double start;
   FILE *f;
 
-  /* escape the jail so that /data and /mnt/usb0 are reachable; done on every
+  /* escape the jail so that /data and the USB are reachable; done on every
    * cycle in case the state was reset while the console was suspended */
   kernel_set_proc_rootdir(pid, kernel_get_root_vnode());
 
-  if(!(f = fopen(CONF_PATH, "r"))) {
+  /* the USB selected at startup must still be there; no other mount point
+   * is ever used in its place */
+  if(!usb_cycle_begin()) {
+    return -1;
+  }
+  if(!(f = fopen(g_conf_path, "r"))) {
+    logq("Cannot read %s (%s)", g_conf_path, strerror(errno));
     return -1;
   }
 
@@ -2147,9 +2212,9 @@ run_cycle(int pending_only) {
     char final[PATH_MAX];
     struct stat st;
     local_clock(wall_clock(), &ci);
-    snprintf(final, sizeof final, "%s/%s", DAILY_ROOT, ci.date);
+    snprintf(final, sizeof final, "%s/%s", g_daily_root, ci.date);
     if((stat(final, &st) || !S_ISDIR(st.st_mode)) &&
-       (progress_total || (!stat(BACKUP_ROOT, &st) && S_ISDIR(st.st_mode))))
+       (progress_total || (!stat(g_backup_root, &st) && S_ISDIR(st.st_mode))))
       progress_plan(1);
   }
   g_progress_planning = 0;
@@ -2174,6 +2239,15 @@ run_cycle(int pending_only) {
   }
   if(g_ps4saves || g_ps5saves) {
     backup_saves(&stats);
+  }
+
+  /* An unplugged USB ends the pass here: nothing is written to the empty
+   * mount point, and the pass is retried on the same USB once it is back. */
+  if(g_usb_lost) {
+    progress_stop();
+    logq("Backup pass aborted: USB %s unavailable (%u file(s) not backed up)",
+         g_usb_root, stats.failed);
+    return -1;
   }
 
   /* Regular files have already been processed. A deferred save-image pass
@@ -2277,6 +2351,28 @@ wait_until(double due, int lock) {
 }
 
 
+/**
+ * Once, after the first completed pass: the date and UTC offset the payload
+ * sees, to check them against the console's clock.
+ **/
+static void
+announce_daily(void) {
+  static int announced;
+  clock_info_t ci;
+  char tz[24];
+
+  if(announced || g_daily <= 0) {
+    return;
+  }
+  announced = 1;
+  local_clock(wall_clock(), &ci);
+  format_offset(ci.offset_min, tz, sizeof tz);
+  logq("Daily backups on: keeping newest %d (console date %s, %s)",
+       g_daily, ci.date, tz);
+  notify("Daily snapshots enabled (%d kept).", g_daily);
+}
+
+
 int
 main(void) {
   int missing = 0;
@@ -2302,26 +2398,33 @@ main(void) {
     return EXIT_FAILURE;
   }
 
+  /* Pick the USB partition that holds backup.conf. Without one, or with one
+   * that cannot be written to, nothing is backed up anywhere. */
+  switch(usb_select()) {
+  case 0:
+    break;
+  case -2:
+    notify("Backup could not start: USB %s is not writable.", g_usb_root);
+    return EXIT_FAILURE;
+  default:
+    notify("backup.conf not found on any USB.");
+    return EXIT_FAILURE;
+  }
+  logq("Starting backup service...");
+
   /* Initial backup immediately; subsequent regular deadlines use monotonic time. */
   started = now_seconds();
   if(run_cycle(0) < 0) {
-    notify("backup.conf not found on USB.");
-    return EXIT_FAILURE;
+    /* the USB was unplugged during the first pass: wait for the same USB to
+     * come back, exactly like a later pass would */
+    notify("USB %s unavailable: backup paused.", g_usb_root);
+    missing = MISSING_TRIES;
+    pending_retry_after = now_seconds() + SLICE_SEC * 3;
+    due = pending_retry_after;
+  } else {
+    announce_daily();
+    due = next_due(started);
   }
-  if(g_daily > 0) {
-    /* shows the date and UTC offset the payload sees, to check them against
-     * the console's clock */
-    clock_info_t ci;
-    char tz[24];
-
-    local_clock(wall_clock(), &ci);
-    format_offset(ci.offset_min, tz, sizeof tz);
-    logq("Daily backups on: keeping newest %d (console date %s, %s)",
-         g_daily, ci.date, tz);
-    notify("Daily snapshots enabled (%d kept).", g_daily);
-  }
-
-  due = next_due(started);
 
   for(;;) {
 #ifdef BACKUP_HOST_TEST
@@ -2340,7 +2443,7 @@ main(void) {
       /* USB drive may still be mounting after rest mode: retry shortly and
        * only complain if it stays missing */
       if(++missing == MISSING_TRIES) {
-        notify("backup.conf not found on USB.");
+        notify("USB %s unavailable: backup paused.", g_usb_root);
       }
       pending_retry_after = now_seconds() + SLICE_SEC * 3;
       due = pending_retry_after;
@@ -2351,8 +2454,10 @@ main(void) {
 #endif
 
     if(missing >= MISSING_TRIES) {
-      logq("backup.conf is back");
+      logq("backup.conf is back on %s", g_usb_root);
+      notify("USB %s is back: backup resumed.", g_usb_root);
     }
+    announce_daily();
     missing = 0;
     pending_retry_after = 0;
 

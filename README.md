@@ -13,6 +13,23 @@ Easy to use USB save backup utility for jailbroken PS5s that helps you prevent d
 - Plug in into your PS5
 - Push the backup.elf payload to your PS5 using a network loader or an autoloader of your choice
 
+The USB partition is found automatically: PS5Save scans `/mnt/usb0`, `/mnt/usb1`, `/mnt/usb2`, ... in numerical order and uses the first one whose root contains `backup.conf`. That partition is used for the configuration, the live backup (`backup/`) and the daily snapshots (`backup_daily/`). A multi-partition drive works too (for example a FAT32 boot partition on `usb0` and the exFAT backup partition on `usb2`): partitions without `backup.conf` are never written to. If no `backup.conf` is found, or the partition is read-only, the payload reports an error and exits without backing anything up. If the drive is unplugged while the payload runs, writing stops until the same partition is back; it never switches to another USB on its own (restart the payload for that).
+
+Startup log (klog), for example:
+```
+[backup] Scanning USB devices...
+[backup] Checking /mnt/usb0
+[backup] Checking /mnt/usb0/backup.conf ... NOT FOUND
+[backup] Checking /mnt/usb1
+[backup] Checking /mnt/usb1 ... not mounted
+[backup] Checking /mnt/usb2
+[backup] Checking /mnt/usb2/backup.conf ... FOUND
+[backup] Found backup.conf
+[backup] Selected USB: /mnt/usb2
+[backup] Backup destination: /mnt/usb2/backup
+[backup] Starting backup service...
+```
+
 PS4/PS5 saves will backed up while in-game except for the game you're currently playing it will be backed up after you exit the title *(since version v2)*
 
 # Backup Configuration
@@ -92,3 +109,4 @@ To rebuild after changing the source:
 make clean
 make
 ```
+
