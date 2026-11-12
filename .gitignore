@@ -3,3 +3,7 @@ ps5savesbackup.elf
 backup.elf
 tests/host/ps5savesbackup_host
 tests/run/
+__pycache__/
+
+# Google OAuth client, never committed
+gdrive_credentials.mk

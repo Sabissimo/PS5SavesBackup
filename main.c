@@ -282,6 +282,8 @@ static int g_watch_game = 0;      /* protect the currently mounted title */
 static int g_game_abort = 0;      /* abort this save image only */
 static int g_backup_busy = 0;     /* one activity warning per copying pass */
 static int g_legacy = 0;          /* settings come from backup.conf on the USB */
+static int g_gdrive_enabled = 0;  /* gdrive_enabled=true in the settings */
+static char g_gdrive_folder[256]; /* gdrive_folder= */
 static int g_wake_pipe[2] = {-1, -1}; /* settings page -> main loop */
 static double g_last_watch = 0;
 static char g_abort_why[192];
@@ -292,6 +294,7 @@ static void ui_log_push(const char *msg);
 static void ui_set_state(const char *state, const char *reason);
 static void ui_set_result(const char *fmt, ...);
 static void ui_set_due(double due);
+static void ui_wake(void);
 
 /* Escape every JSON control character and reject overflow rather than emit
  * truncated or malformed JSON. UTF-8 bytes are preserved. */
@@ -576,7 +579,7 @@ fs_free(const char *path, const char *test_env) {
 
 #include "usb_storage.h"
 
-#define usb_free()   fs_free(g_usb_root, "TEST_USB_FREE")
+#define usb_free()   fs_free(g_dest_root, "TEST_USB_FREE")
 #define data_free()  fs_free(TMP_DIR, "TEST_DATA_FREE")
 
 
@@ -931,6 +934,15 @@ priv_restore(const priv_state_t *old) {
   kernel_set_proc_jaildir(me, old->jaildir);
 }
 
+
+#define GDRIVE_DEFAULT_FOLDER "PS5SavesBackup"
+
+/* A Google Drive folder name: not empty, at most 200 bytes, no path separators. */
+static int
+gdrive_folder_valid(const char *name) {
+  size_t len = strlen(name);
+  return len > 0 && len <= 200 && !strchr(name, '/') && !strchr(name, '\\');
+}
 
 /* Configuration booleans accept exactly the documented lowercase tokens. */
 static int
@@ -1717,6 +1729,14 @@ backup_entry(char *line, backup_stats_t *stats) {
     parse_bool(value, &g_ps5saves);
     return;
   }
+  if((value = config_value(line, "gdrive_enabled", "gdrive_enabled"))) {
+    parse_bool(value, &g_gdrive_enabled);
+    return;
+  }
+  if((value = config_value(line, "gdrive_folder", "gdrive_folder"))) {
+    if(gdrive_folder_valid(value)) snprintf(g_gdrive_folder, sizeof g_gdrive_folder, "%s", value);
+    return;
+  }
 
   if(g_pending_only) return;
 
@@ -2217,6 +2237,8 @@ run_cycle(int pending_only) {
   g_ps5saves = 0;
   g_game_abort = 0;
   g_watch_game = 0;
+  g_gdrive_enabled = 0;
+  snprintf(g_gdrive_folder, sizeof g_gdrive_folder, "%s", GDRIVE_DEFAULT_FOLDER);
 
   g_progress_planning = 1;
   while(fgets(line, sizeof line, f)) {
@@ -2241,7 +2263,8 @@ run_cycle(int pending_only) {
   memset(&stats, 0, sizeof stats);
   g_interval = DEF_INTERVAL;
   g_max_game = DEF_GAME_MB * BYTES_PER_MB;
-  g_daily = g_ps4saves = g_ps5saves = 0;
+  g_daily = g_ps4saves = g_ps5saves = g_gdrive_enabled = 0;
+  snprintf(g_gdrive_folder, sizeof g_gdrive_folder, "%s", GDRIVE_DEFAULT_FOLDER);
   while(fgets(line, sizeof line, f)) {
     backup_entry(line, &stats);
   }
@@ -2380,6 +2403,7 @@ wait_until(double due, int lock) {
 
 
 #include "settings.h"
+#include "gdrive.h"
 #include "web_ui.h"
 
 
@@ -2404,8 +2428,16 @@ source_select(char *why, size_t len) {
     }
     settings_load(DATA_CONF, s);
     if(!usb_id_valid(s->usb_id)) {
+      int gdrive = s->gdrive;
       settings_free(s);
       usb_clear();
+      if(gdrive) {
+        /* Google Drive without a USB: the backup is kept on internal storage */
+        rc = dest_select_internal(DATA_DIR);
+        ui_sync();
+        if(rc) snprintf(why, len, "Cannot create the backup folder on internal storage.");
+        return rc;
+      }
       ui_sync();
       snprintf(why, len, "No backup USB selected: open the settings page.");
       return -1;
@@ -2454,7 +2486,11 @@ source_changed(void) {
     return 0;
   }
   settings_load(DATA_CONF, s);
-  changed = strcmp(s->usb_id, g_usb_id) != 0;
+  if(g_dest_internal) {
+    changed = usb_id_valid(s->usb_id) || !s->gdrive;
+  } else {
+    changed = strcmp(s->usb_id, g_usb_id) != 0;
+  }
   settings_free(s);
   return changed;
 }
@@ -2600,6 +2636,10 @@ main(void) {
       notify("USB %s is back: backup resumed.", g_usb_root);
     }
     announce_daily();
+    if(g_gdrive_enabled) {
+      ui_set_state("uploading", "");
+      gd_sync(g_backup_root, g_gdrive_folder);
+    }
     ui_set_state("running", "");
     ui_sync();
     missing = 0;

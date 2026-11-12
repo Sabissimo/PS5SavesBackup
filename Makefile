@@ -6,10 +6,21 @@ endif
 
 ELF    := ps5savesbackup.elf
 CFLAGS := -O2 -Wall -Wextra -Werror
-LDLIBS := -lSceFsInternalForVsh -lSceNotification -lSceSystemService -lSceUserService -lpthread
+
+# Google OAuth client for the Drive sign-in ("TVs and Limited Input devices"
+# type). Pass GDRIVE_CLIENT_ID=... GDRIVE_CLIENT_SECRET=... to make, or put
+# the two assignments into gdrive_credentials.mk (ignored by git). A build
+# without them has the Google Drive sign-in disabled.
+-include gdrive_credentials.mk
+GDRIVE_CLIENT_ID     ?=
+GDRIVE_CLIENT_SECRET ?=
+CREDENTIAL_FLAGS := -DGDRIVE_CLIENT_ID='"$(GDRIVE_CLIENT_ID)"' -DGDRIVE_CLIENT_SECRET='"$(GDRIVE_CLIENT_SECRET)"'
+CFLAGS += $(CREDENTIAL_FLAGS)
+LDLIBS := -lSceFsInternalForVsh -lSceNotification -lSceSystemService -lSceUserService \
+          -lSceNet -lSceSsl -lSceHttp2 -lpthread
 
 HEADERS := notification_icon.h backup_progress.h title_activity.h change_index.h \
-           usb_storage.h settings.h web_ui.h web_page.h
+           usb_storage.h settings.h http_client.h gdrive.h web_ui.h web_page.h
 
 all: $(ELF)
 
@@ -25,7 +36,7 @@ web_page.h: web/index.html tools/embed.py
 	python3 tools/embed.py web/index.html web_index_html > $@
 
 # ---------------------------------------------------------------------------
-# Host test (Linux, clang): make test
+# Host test (Linux, clang, libcurl-dev, python3): make test
 # All console paths are redirected below TEST_ROOT; USB mount points are
 # plain folders (or tmpfs mounts when run as root) under TEST_ROOT/mnt.
 # ---------------------------------------------------------------------------
@@ -38,14 +49,16 @@ HOST_CFLAGS := -O1 -g -Wall -Wextra -Werror -DBACKUP_HOST_TEST \
   -DHOME_ROOT='"$(TEST_ROOT)/home"' -DTMP_DIR='"$(TEST_ROOT)/data"' \
   -DPFS_ROOT='"$(TEST_ROOT)/pfs"' -DPFSMGR_DEV='"$(TEST_ROOT)/pfsmgr"' \
   -DNOTIFICATION_ICON_DIR='"$(TEST_ROOT)/icon"' \
-  -DLOCK_PORT=19055 -DWEB_PORT=19056 -DMIN_INTERVAL=1 -DSLICE_SEC=1
+  -DLOCK_PORT=19055 -DWEB_PORT=19056 -DMIN_INTERVAL=1 -DSLICE_SEC=1 \
+  $(if $(GDRIVE_CLIENT_ID),$(CREDENTIAL_FLAGS),-DGDRIVE_CLIENT_ID='"test-client"' -DGDRIVE_CLIENT_SECRET='"test-secret"')
 
 $(HOST_BIN): main.c $(HEADERS) tests/host/stubs.c
-	$(HOST_CC) $(HOST_CFLAGS) main.c tests/host/stubs.c -lpthread -o $@
+	$(HOST_CC) $(HOST_CFLAGS) main.c tests/host/stubs.c -lpthread -lcurl -o $@
 
 test: $(HOST_BIN)
 	TEST_ROOT=$(TEST_ROOT) bash tests/usb_detection.sh $(HOST_BIN)
 	TEST_ROOT=$(TEST_ROOT) bash tests/web_ui.sh $(HOST_BIN)
+	TEST_ROOT=$(TEST_ROOT) bash tests/gdrive.sh $(HOST_BIN)
 
 .PHONY: all clean test
 clean:

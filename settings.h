@@ -20,6 +20,8 @@ typedef struct settings {
   long max_mb;
   int  daily;
   char usb_id[USB_ID_LEN + 1];
+  int  gdrive;
+  char gdrive_folder[256];
   int  npaths;
   char (*paths)[PATH_MAX];
 } settings_t;
@@ -33,6 +35,8 @@ settings_defaults(settings_t *s) {
   s->max_mb = DEF_GAME_MB;
   s->daily = 0;
   s->usb_id[0] = 0;
+  s->gdrive = 0;
+  snprintf(s->gdrive_folder, sizeof s->gdrive_folder, "%s", GDRIVE_DEFAULT_FOLDER);
   s->npaths = 0;
 }
 
@@ -101,6 +105,10 @@ settings_line(settings_t *s, char *line) {
     parse_bool(value, &s->ps5);
   } else if((value = config_value(line, "usb_id", "usb_id"))) {
     if(usb_id_valid(value)) snprintf(s->usb_id, sizeof s->usb_id, "%s", value);
+  } else if((value = config_value(line, "gdrive_enabled", "gdrive_enabled"))) {
+    parse_bool(value, &s->gdrive);
+  } else if((value = config_value(line, "gdrive_folder", "gdrive_folder"))) {
+    if(gdrive_folder_valid(value)) snprintf(s->gdrive_folder, sizeof s->gdrive_folder, "%s", value);
   } else if(line[0] == '/') {
     settings_add_path(s, line);
   }
@@ -168,10 +176,17 @@ settings_save(const char *path, const settings_t *s) {
     "# Id of the backup USB partition (content of its %s file); pick it on the settings page\n"
     "usb_id=%s\n"
     "\n"
+    "# Upload the backup to Google Drive (false, true); sign in on the settings page\n"
+    "gdrive_enabled=%s\n"
+    "\n"
+    "# Name of the folder in My Drive that receives the backup\n"
+    "gdrive_folder=%s\n"
+    "\n"
     "# Files and folders to back up, one absolute path per line\n",
     MIN_INTERVAL, MAX_INTERVAL, s->interval,
     s->ps4 ? "true" : "false", s->ps5 ? "true" : "false",
-    s->max_mb, MAX_DAILY, s->daily, MARKER_NAME, s->usb_id) > 0;
+    s->max_mb, MAX_DAILY, s->daily, MARKER_NAME, s->usb_id,
+    s->gdrive ? "true" : "false", s->gdrive_folder) > 0;
   for(int i = 0; i < s->npaths && ok; i++) {
     ok = fprintf(f, "%s\n", s->paths[i]) > 0;
   }
@@ -297,6 +312,20 @@ settings_from_form(const char *body, settings_t *s, char *err, size_t len) {
   s->daily = (int)v;
   s->ps4 = form_flag(body, "ps4");
   s->ps5 = form_flag(body, "ps5");
+  s->gdrive = form_flag(body, "gdrive");
+  if(form_get(body, "gdrive_folder", s->gdrive_folder, sizeof s->gdrive_folder)) {
+    char *p = s->gdrive_folder;
+    size_t l;
+    while(*p == ' ') p++;
+    memmove(s->gdrive_folder, p, strlen(p) + 1);
+    l = strlen(s->gdrive_folder);
+    while(l && s->gdrive_folder[l-1] == ' ') s->gdrive_folder[--l] = 0;
+    if(!l) snprintf(s->gdrive_folder, sizeof s->gdrive_folder, "%s", GDRIVE_DEFAULT_FOLDER);
+    if(!gdrive_folder_valid(s->gdrive_folder)) {
+      snprintf(err, len, "Google Drive folder name must not contain / or \\");
+      return 0;
+    }
+  }
 
   if(!(paths = malloc(plen))) {
     snprintf(err, len, "not enough memory");

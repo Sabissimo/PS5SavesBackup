@@ -32,6 +32,8 @@ static struct {
   char usb_id[USB_ID_LEN + 1];
   int legacy;
   int usb_lost;
+  int dest_internal;
+  char backup_root[PATH_MAX];
   time_t result_at;
   double next_due;          /* monotonic, 0 = unknown */
 } ui;
@@ -90,6 +92,8 @@ ui_sync(void) {
   snprintf(ui.usb_id, sizeof ui.usb_id, "%s", g_usb_id);
   ui.legacy = g_legacy;
   ui.usb_lost = g_usb_lost;
+  ui.dest_internal = g_dest_internal;
+  snprintf(ui.backup_root, sizeof ui.backup_root, "%s", g_backup_root);
   pthread_mutex_unlock(&ui_mutex);
 }
 
@@ -458,10 +462,16 @@ api_status(int c) {
   jw_field_str(&w, "usb_root", ui.usb_root, 1);
   jw_field_str(&w, "usb_id", ui.usb_id, 1);
   jw_field_bool(&w, "usb_lost", ui.usb_lost, 1);
+  jw_field_bool(&w, "dest_internal", ui.dest_internal, 1);
+  jw_field_str(&w, "backup_root", ui.backup_root, 1);
   jw_field_str(&w, "conf_path", ui.conf_path, 1);
   jw_field_bool(&w, "legacy", ui.legacy, 1);
-  jw_field_num(&w, "usb_free", ui.usb_root[0] && !ui.usb_lost ? (long long)fs_free(ui.usb_root, "TEST_USB_FREE") : 0, 1);
-  jw_field_num(&w, "usb_total", ui.usb_root[0] && !ui.usb_lost ? (long long)fs_total(ui.usb_root) : 0, 1);
+  {
+    const char *space = ui.dest_internal ? ui.backup_root : ui.usb_root;
+    int have = space[0] && !ui.usb_lost;
+    jw_field_num(&w, "usb_free", have ? (long long)fs_free(space, "TEST_USB_FREE") : 0, 1);
+    jw_field_num(&w, "usb_total", have ? (long long)fs_total(space) : 0, 1);
+  }
   pthread_mutex_unlock(&ui_mutex);
   jw_field_bool(&w, "settings_file", !stat(DATA_CONF, &st) && S_ISREG(st.st_mode), 1);
   jw_field_str(&w, "settings_path", DATA_CONF, 1);
@@ -502,6 +512,8 @@ api_config_get(int c) {
   jw_field_num(&w, "max_mb", s->max_mb, 1);
   jw_field_num(&w, "daily", s->daily, 1);
   jw_field_str(&w, "usb_id", s->usb_id, 1);
+  jw_field_bool(&w, "gdrive", s->gdrive, 1);
+  jw_field_str(&w, "gdrive_folder", s->gdrive_folder, 1);
   jw_raw(&w, ",\"paths\":[");
   for(int i = 0; i < s->npaths; i++) {
     if(i) jw_raw(&w, ",");
@@ -677,6 +689,45 @@ api_usb_select(int c, const char *body) {
 
 
 static void
+api_gdrive_status(int c) {
+  char buf[4096];
+  jw_t w = {buf, sizeof buf, 0, 0};
+  int connected = gd_connected();
+  time_t now = wall_clock();
+
+  pthread_mutex_lock(&gd_mutex);
+  jw_raw(&w, "{");
+  jw_field_bool(&w, "configured", strcmp(GDRIVE_CLIENT_ID, "") != 0, 0);
+  jw_field_bool(&w, "connected", connected, 1);
+  jw_field_bool(&w, "pending", gd_state.pending, 1);
+  jw_field_str(&w, "user_code", gd_state.pending ? gd_state.user_code : "", 1);
+  jw_field_str(&w, "verification_url", gd_state.pending ? gd_state.verification_url : "", 1);
+  jw_field_num(&w, "code_expires_in", gd_state.pending && gd_state.expires > now ? (long long)(gd_state.expires - now) : 0, 1);
+  jw_field_str(&w, "message", gd_state.message, 1);
+  jw_field_str(&w, "progress", gd_state.progress, 1);
+  jw_field_num(&w, "last_sync_age", gd_state.last_sync ? (long long)(now - gd_state.last_sync) : -1, 1);
+  jw_field_num(&w, "last_files", gd_state.last_files, 1);
+  jw_field_num(&w, "last_bytes", (long long)gd_state.last_bytes, 1);
+  jw_field_str(&w, "last_error", gd_state.last_error, 1);
+  jw_raw(&w, "}");
+  pthread_mutex_unlock(&gd_mutex);
+  web_json(c, "200 OK", &w);
+}
+
+
+static void
+api_gdrive_connect(int c) {
+  char err[256];
+
+  if(gd_auth_begin(err, sizeof err)) {
+    web_message(c, "400 Bad Request", "error", err);
+    return;
+  }
+  api_gdrive_status(c);
+}
+
+
+static void
 api_log(int c) {
   char *buf = malloc(UI_LOG_LINES * UI_LOG_WIDTH * 6 + 64);
   jw_t w = {buf, UI_LOG_LINES * UI_LOG_WIDTH * 6 + 64, 0, 0};
@@ -723,6 +774,14 @@ web_handle(int c) {
   } else if(!strcmp(method, "POST") && !strcmp(path, "/api/backup")) {
     ui_wake();
     web_message(c, "200 OK", "ok", "Backup pass requested");
+  } else if(!strcmp(method, "GET") && !strcmp(path, "/api/gdrive/status")) {
+    api_gdrive_status(c);
+  } else if(!strcmp(method, "POST") && !strcmp(path, "/api/gdrive/connect")) {
+    api_gdrive_connect(c);
+  } else if(!strcmp(method, "POST") && !strcmp(path, "/api/gdrive/disconnect")) {
+    gd_disconnect();
+    ui_wake();
+    web_message(c, "200 OK", "ok", "Signed out of Google Drive");
   } else if(!strcmp(method, "GET") && !strcmp(path, "/api/log")) {
     api_log(c);
   } else {

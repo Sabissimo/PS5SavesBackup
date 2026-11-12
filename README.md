@@ -8,7 +8,7 @@ PS5SavesBackup is a background payload that keeps copies of your game saves and 
 - PS5 saves, PS4 saves (decrypted), emulator saves and any other files or folders you list
 - **Settings page**: everything is configured from a web page served by the payload, opened in the console browser or from your phone or PC. No more editing files by hand.
 - **Any USB layout**: the backup partition is picked on the settings page and found again at every start, whatever `/mnt/usbN` number it gets. Multi-partition drives (for example a Linux boot partition plus an exFAT backup partition) work.
-- Backup destinations beyond USB (Google Drive) are planned; the settings page is where they will be set up.
+- **Google Drive**: backups can also go to your own Google Drive, with or without a USB. Sign in from the settings page with a short code typed on your phone; the app only ever sees the files it created itself.
 
 <img width="1280" height="720" alt="Notification screenshot" src="https://github.com/user-attachments/assets/cbef0c27-b218-4da1-943c-f6c0da6e0ef4" />
 
@@ -18,6 +18,8 @@ PS5SavesBackup is a background payload that keeps copies of your game saves and 
 2. Push `ps5savesbackup.elf` to your PS5 with a network loader or an autoloader.
 3. A notification shows the address of the settings page, for example `http://192.168.1.23:9056/`. On a first run without any configuration the payload also opens it in the console browser.
 4. On the page: pick the backup partition, enable PS4/PS5 saves, add any extra paths, save.
+
+Optionally, on the same page, tick "Upload the backup to Google Drive" and press "Sign in to Google": open the shown link on a phone or PC, enter the code, done. Without a USB the backup is kept on the console's internal storage and uploaded from there.
 
 Backups start right away and repeat at the configured interval. The settings page shows the state, the last result, free space and the recent log. A "Back up now" button runs a pass immediately.
 
@@ -30,6 +32,8 @@ PS4/PS5 saves are backed up while in-game except for the game you are currently 
 **Backup USB.** When you pick a partition on the page, a small file `PS5SavesBackup.id` with a random id is written to its root and the id is stored in the settings (`usb_id=`). At every start the payload scans `/mnt/usb0`, `/mnt/usb1`, ... in numerical order and selects the partition whose marker matches. Partitions without the marker are never written to, there is no fallback to `/mnt/usb0`, and the destination changes only when you pick another partition. If the drive is unplugged while the payload runs, writing stops until the same partition is back.
 
 **Compatibility with PS5Save.** Without a settings file the payload behaves like PS5Save v2: the first USB whose root holds a `backup.conf` is used. The settings page shows those settings; saving them once moves them to the internal file and marks that USB.
+
+**Google Drive.** After every backup pass the live backup folder is mirrored into a folder in My Drive (name set in the settings, `PS5SavesBackup` by default): new and changed files are uploaded, unchanged ones are skipped using an index kept in `/data/homebrew/PS5SavesBackup/gdrive.index`. Daily snapshots are not uploaded (they would re-send the whole backup every day), and files removed locally stay in Drive. The sign-in token is stored in `/data/homebrew/PS5SavesBackup/gdrive.token`; "Sign out" on the page revokes it at Google and deletes it. The app requests the `drive.file` permission only, so it cannot see any other file in your Drive. Access can also be revoked at https://myaccount.google.com/permissions.
 
 **On the USB:**
 ```
@@ -76,6 +80,12 @@ daily_snapshots_to_keep=2
 # Id of the backup USB partition (content of its PS5SavesBackup.id file); pick it on the settings page
 usb_id=0123456789abcdef0123456789abcdef
 
+# Upload the backup to Google Drive (false, true); sign in on the settings page
+gdrive_enabled=false
+
+# Name of the folder in My Drive that receives the backup
+gdrive_folder=PS5SavesBackup
+
 # Files and folders to back up, one absolute path per line
 
 # PS5SX2
@@ -103,7 +113,7 @@ See [PRIVACY.md](PRIVACY.md): the software stores data only on your console, on 
 
 # Network
 
-The settings page listens on port 9056 on the console's LAN address. Like the other PS5 homebrew services (FTP, payload loaders) it has no password: anyone on your home network can open it. The payload makes no connections to the internet.
+The settings page listens on port 9056 on the console's LAN address. Like the other PS5 homebrew services (FTP, payload loaders) it has no password: anyone on your home network can open it. The payload connects to the internet only when Google Drive is enabled, and then only to Google's OAuth and Drive API servers over HTTPS (the console's own `libSceHttp2`/`libSceSsl`).
 
 Port 9055 on the loopback interface is used to replace a running instance.
 
@@ -141,6 +151,14 @@ make
 
 The compiled payload is `ps5savesbackup.elf`.
 
+**Google Drive sign-in** needs an OAuth client of the "TVs and Limited Input devices" type from the [Google Cloud console](https://console.cloud.google.com) (enable the Google Drive API, configure the consent screen with the `drive.file` scope and publish it, then create the client). The client id and secret are compiled into the payload; they are not in the repository. Either pass them to make:
+
+```sh
+make GDRIVE_CLIENT_ID=1234-abc.apps.googleusercontent.com GDRIVE_CLIENT_SECRET=GOCSPX-...
+```
+
+or put the same two assignments into `gdrive_credentials.mk` next to the Makefile (git ignores it). A build without them works normally except that the Google sign-in is disabled. For this client type Google does not treat the secret as confidential, since it ships inside the application.
+
 To rebuild after changing the source:
 
 ```sh
@@ -152,10 +170,10 @@ The settings page is `web/index.html`, embedded into the payload as `web_page.h`
 
 ## Testing
 
-The USB detection and the settings page can be exercised on a Linux host without a console or the SDK (clang and curl required). `main.c` is built with `-DBACKUP_HOST_TEST` against stubbed PS5 APIs (`tests/host/`); all console paths are redirected below `tests/run`:
+The USB detection, the settings page and the Google Drive upload can be exercised on a Linux host without a console or the SDK (clang, libcurl development headers, curl and python3 required). `main.c` is built with `-DBACKUP_HOST_TEST` against stubbed PS5 APIs (`tests/host/`); all console paths are redirected below `tests/run`:
 
 ```sh
 make test
 ```
 
-`tests/usb_detection.sh` covers: legacy configuration on usb0, usb1, usb2 and usb10 (numeric order), several partitions with only one `backup.conf`, several with one (lowest number wins), no configuration, a read-only partition, a USB unplugged while running, sources overlapping the destination, and selection by marker id (ignoring legacy files, marked USB not connected, no selection). `tests/web_ui.sh` covers the page and its API: status, migration from a legacy `backup.conf`, validation, switching the USB, "back up now", the log, and first start without any configuration. The read-only and unplug scenarios use real tmpfs mounts and therefore need root; run `VERBOSE=1 make test` to print the payload log of a failed check.
+`tests/usb_detection.sh` covers: legacy configuration on usb0, usb1, usb2 and usb10 (numeric order), several partitions with only one `backup.conf`, several with one (lowest number wins), no configuration, a read-only partition, a USB unplugged while running, sources overlapping the destination, and selection by marker id (ignoring legacy files, marked USB not connected, no selection). `tests/web_ui.sh` covers the page and its API: status, migration from a legacy `backup.conf`, validation, switching the USB, "back up now", the log, and first start without any configuration. `tests/gdrive.sh` runs against `tests/fake_google.py`, a stand-in for Google's OAuth and Drive endpoints: device-code sign-in, upload of a folder tree, unchanged/changed/remotely deleted files, retries on server errors, access token refresh, a renamed Drive folder, USB plus Drive, a revoked token, a declined sign-in, sign-out and an unreachable server. The read-only and unplug scenarios use real tmpfs mounts and therefore need root; run `VERBOSE=1 make test` to print the payload log of a failed check.

@@ -68,6 +68,23 @@
     <div class="msg" id="usbMsg"></div>
   </section>
 
+  <section id="gdrive">
+    <h2>Google Drive</h2>
+    <div class="row"><span class="kv">Account: <b id="gdState">...</b></span></div>
+    <div id="gdCode" style="display:none;margin-top:12px">
+      <p class="hint">On a phone or PC open <b id="gdUrl" style="color:var(--fg)"></b> and enter this code:</p>
+      <div style="font-size:42px;font-weight:700;letter-spacing:4px;margin:6px 0" id="gdUserCode"></div>
+      <p class="hint" id="gdExpires"></p>
+    </div>
+    <div class="row" style="margin-top:6px"><span class="kv" id="gdLast"></span></div>
+    <p class="hint">Backups are uploaded to a folder in My Drive after every backup pass. The sign-in gives this app access only to files it created itself. Enable the upload and set the folder name in Settings below.</p>
+    <div class="actions">
+      <button id="gdConnect">Sign in to Google</button>
+      <button id="gdDisconnect" class="secondary">Sign out</button>
+    </div>
+    <div class="msg" id="gdMsg"></div>
+  </section>
+
   <section id="settings">
     <h2>Settings</h2>
     <form id="form">
@@ -79,6 +96,9 @@
       <input type="number" id="max_mb" name="max_mb" min="64" max="65536" required>
       <label for="daily">Daily snapshots to keep (0–10, 0 = off)</label>
       <input type="number" id="daily" name="daily" min="0" max="10" required>
+      <div class="check"><input type="checkbox" id="gdrive" name="gdrive"><label for="gdrive" style="margin:0">Upload the backup to Google Drive (works without a USB too: the backup is then kept on internal storage)</label></div>
+      <label for="gdrive_folder">Google Drive folder name</label>
+      <input type="text" id="gdrive_folder" name="gdrive_folder" maxlength="200" style="width:100%;max-width:420px;background:#0f1115;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:inherit">
       <label for="paths">Files and folders to back up (one absolute path per line)</label>
       <textarea id="paths" name="paths" spellcheck="false"></textarea>
       <div class="actions">
@@ -126,6 +146,28 @@
       $('next').textContent = s.next_in >= 0 ? 'in ' + s.next_in + ' s' : '-';
       $('result').textContent = s.result ? s.result + ' (' + fmtAge(s.result_age) + ')' : '-';
       $('conf').textContent = s.conf_path ? s.conf_path + (s.legacy ? ' (legacy, on the USB; saving moves it to ' + s.settings_path + ')' : '') : s.settings_path + ' (not created yet)';
+      if (s.dest_internal) {
+        $('usb').textContent = 'none (backup kept on internal storage for Google Drive)';
+        $('free').textContent = fmtBytes(s.usb_free) + ' free on internal storage';
+      }
+    });
+  }
+  function gdrive() {
+    return get('/api/gdrive/status').then(function (g) {
+      var st = !g.configured ? 'not available in this build' : g.connected ? 'signed in' : g.pending ? 'waiting for the code' : 'not signed in';
+      $('gdState').textContent = st + (g.message && !g.connected && !g.pending ? ' (' + g.message + ')' : '');
+      $('gdCode').style.display = g.pending ? 'block' : 'none';
+      if (g.pending) {
+        $('gdUrl').textContent = g.verification_url; $('gdUserCode').textContent = g.user_code;
+        $('gdExpires').textContent = 'The code is valid for ' + Math.floor(g.code_expires_in / 60) + ' more minutes.';
+      }
+      var last = '';
+      if (g.progress) last = g.progress;
+      else if (g.last_error) last = 'Last upload: ' + g.last_error;
+      else if (g.last_sync_age >= 0) last = 'Last upload: ' + (g.last_files ? g.last_files + ' files, ' + fmtBytes(g.last_bytes) : 'up to date') + ' (' + fmtAge(g.last_sync_age) + ')';
+      $('gdLast').textContent = last;
+      $('gdConnect').disabled = !g.configured || g.connected || g.pending;
+      $('gdDisconnect').disabled = !g.connected && !g.pending;
     });
   }
   function mounts() {
@@ -146,6 +188,7 @@
     return get('/api/config').then(function (c) {
       $('interval').value = c.interval; $('ps4').checked = c.ps4; $('ps5').checked = c.ps5;
       $('max_mb').value = c.max_mb; $('daily').value = c.daily; $('paths').value = c.paths.join('\n');
+      $('gdrive').checked = c.gdrive; $('gdrive_folder').value = c.gdrive_folder;
     });
   }
   function log() {
@@ -161,6 +204,7 @@
     var p = new URLSearchParams();
     p.set('interval', $('interval').value); p.set('max_mb', $('max_mb').value); p.set('daily', $('daily').value);
     if ($('ps4').checked) p.set('ps4', 'on'); if ($('ps5').checked) p.set('ps5', 'on');
+    if ($('gdrive').checked) p.set('gdrive', 'on'); p.set('gdrive_folder', $('gdrive_folder').value);
     p.set('paths', $('paths').value);
     $('save').disabled = true;
     post('/api/config', p).then(function (j) { note($('formMsg'), j); return status().then(mounts); })
@@ -178,12 +222,20 @@
       .catch(function (err) { note($('usbMsg'), { error: String(err) }); })
       .then(function () { $('useUsb').disabled = false; });
   });
+  $('gdConnect').addEventListener('click', function () {
+    $('gdConnect').disabled = true;
+    post('/api/gdrive/connect').then(function (j) { if (j.error) note($('gdMsg'), j); else $('gdMsg').textContent = ''; return gdrive(); })
+      .catch(function (err) { note($('gdMsg'), { error: String(err) }); });
+  });
+  $('gdDisconnect').addEventListener('click', function () {
+    post('/api/gdrive/disconnect').then(function (j) { note($('gdMsg'), j); return gdrive(); });
+  });
   $('backupNow').addEventListener('click', function () {
     post('/api/backup').then(function () { setTimeout(function () { status(); log(); }, 1500); });
   });
 
-  status().then(mounts).then(config).then(log);
-  setInterval(function () { status(); log(); }, 5000);
+  status().then(mounts).then(config).then(gdrive).then(log);
+  setInterval(function () { status(); gdrive(); log(); }, 5000);
   setInterval(mounts, 15000);
 })();
 </script>

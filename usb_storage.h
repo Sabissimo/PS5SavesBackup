@@ -32,6 +32,8 @@
 #endif
 
 static char g_usb_root[PATH_MAX];     /* e.g. /mnt/usb2; empty until selected */
+static char g_dest_root[PATH_MAX];    /* local destination: the USB, or DATA_DIR */
+static int g_dest_internal;           /* backups go to internal storage (Google Drive mode) */
 static char g_conf_path[PATH_MAX];    /* settings file in use (internal or legacy USB) */
 static char g_backup_root[PATH_MAX];  /* <usb>/backup */
 static char g_daily_root[PATH_MAX];   /* <usb>/backup_daily */
@@ -240,10 +242,35 @@ usb_writable(void) {
 
 static void
 usb_clear(void) {
-  g_usb_root[0] = g_backup_root[0] = g_daily_root[0] = g_usb_id[0] = 0;
+  g_usb_root[0] = g_dest_root[0] = g_backup_root[0] = g_daily_root[0] = g_usb_id[0] = 0;
   g_usb_dev = 0;
   g_usb_ino = 0;
   g_usb_lost = 0;
+  g_dest_internal = 0;
+}
+
+
+/**
+ * Backups go to internal storage below dir (used with Google Drive and no
+ * USB). The same presence/overlap guards apply to that folder.
+ **/
+static int
+dest_select_internal(const char *dir) {
+  struct stat st;
+
+  usb_clear();
+  if(mkdir_p(dir) || stat(dir, &st) || !S_ISDIR(st.st_mode)) {
+    logq("Cannot create %s (%s)", dir, strerror(errno));
+    return -1;
+  }
+  snprintf(g_dest_root, sizeof g_dest_root, "%s", dir);
+  snprintf(g_backup_root, sizeof g_backup_root, "%s/%s", dir, BACKUP_DIR);
+  snprintf(g_daily_root, sizeof g_daily_root, "%s/%s", dir, DAILY_DIR);
+  g_usb_dev = st.st_dev;
+  g_usb_ino = st.st_ino;
+  g_dest_internal = 1;
+  logq("Backup destination: %s (internal storage, for Google Drive)", g_backup_root);
+  return mkdir_p(g_backup_root) ? -1 : 0;
 }
 
 
@@ -286,6 +313,7 @@ usb_select(const char *usb_id) {
     }
     logq("Found %s", usb_id ? MARKER_NAME : CONF_NAME);
     snprintf(g_usb_root, sizeof g_usb_root, "%s", root);
+    snprintf(g_dest_root, sizeof g_dest_root, "%s", root);
     snprintf(g_backup_root, sizeof g_backup_root, "%s/%s", root, BACKUP_DIR);
     snprintf(g_daily_root, sizeof g_daily_root, "%s/%s", root, DAILY_DIR);
     snprintf(g_usb_id, sizeof g_usb_id, "%s", usb_id ? usb_id : "");
@@ -321,6 +349,9 @@ usb_online(void) {
   struct stat st;
   char content[128];
 
+  if(g_dest_internal) {
+    return 1;
+  }
   if(!g_usb_root[0]) {
     return 0;
   }
@@ -364,6 +395,9 @@ static int
 usb_cycle_begin(void) {
   struct stat parent, st;
 
+  if(g_dest_internal) {
+    return 1;
+  }
   if(!g_usb_root[0]) {
     return 0;
   }
@@ -462,7 +496,7 @@ source_overlaps_usb(const char *path) {
   if(!path_normalize(path, norm, sizeof norm) || !strcmp(norm, "/")) {
     return 1;
   }
-  return path_within(norm, g_usb_root) || path_within(g_usb_root, norm);
+  return path_within(norm, g_dest_root) || path_within(g_dest_root, norm);
 }
 
 
@@ -470,7 +504,7 @@ source_overlaps_usb(const char *path) {
  * mount of the same file system below a source folder). */
 static int
 is_usb_root_dir(const struct stat *st) {
-  return g_usb_root[0] && S_ISDIR(st->st_mode) &&
+  return g_dest_root[0] && S_ISDIR(st->st_mode) &&
          st->st_dev == g_usb_dev && st->st_ino == g_usb_ino;
 }
 
