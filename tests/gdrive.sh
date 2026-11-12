@@ -148,6 +148,33 @@ assert_log "Google Drive: uploading 5 file(s) to folder My PS5 saves"
 check "no marker or probe uploaded" "[ -z \"\$(file_id PS5SavesBackup.id)\" ] && [ -z \"\$(file_id .ps5save-index)\" ]"
 stop
 
+echo "== Scenario: download the backup from Google Drive on a console without one"
+rm -rf "${DATA:?}/backup" "$DATA/gdrive.index" "$T/mnt/usb2"
+rm -rf "${T:?}/src"; mkdir -p "$T/src"; echo fresh > "$T/src/fresh.txt"
+settings "" true "My PS5 saves"
+start
+wait_log "Backup complete"
+r=$(curl -s -X POST "$URL/api/gdrive/download")
+check "download queued (got: $r)" "has '$r' 'Download queued'"
+for i in $(seq 1 200); do st=$(curl -s "$URL/api/restore/status"); has "$st" '"busy":false' && has "$st" 'Download from Google Drive' && break; sleep 0.1; done
+check "download reported ok" "has '$st' '\"last_ok\":true' && has '$st' 'downloaded'"
+assert_log "Google Drive: downloading folder My PS5 saves to $DATA/backup"
+A=$DATA/backup$T/src
+check "files downloaded with content" "[ \"\$(cat '$A/a.txt')\" = alpha2 ] && [ \"\$(cat '$A/sub/b.txt')\" = beta2 ] && [ -f '$A/big.bin' ]"
+check "downloaded files have the index entries" "grep -qP '^F\t[^\t]+\t6\t' '$DATA/gdrive.index' && grep -q 'src/sub/b.txt' '$DATA/gdrive.index'"
+uploads() { dump | python3 -I -c "import json,sys; print(json.load(sys.stdin)['counters'].get('uploads', 0))"; }
+sleep 2.5
+n=$(uploads)
+sleep 2.5
+check "downloaded files are not uploaded again" "[ \$(uploads) = $n ]"
+r=$(curl -s -X POST "$URL/api/gdrive/download")
+for i in $(seq 1 200); do st=$(curl -s "$URL/api/restore/status"); has "$st" '"busy":false' && has "$st" '0 file(s) downloaded' && break; sleep 0.1; done
+check "second download finds everything present" "has '$st' '0 file(s) downloaded'"
+check "local extra file kept" "[ -f '$A/fresh.txt' ]"
+stop
+mkdir -p "$T/mnt/usb2"; echo 0123456789abcdef0123456789abcdef > "$T/mnt/usb2/PS5SavesBackup.id"
+settings 0123456789abcdef0123456789abcdef true "My PS5 saves"
+
 echo "== Scenario: revoked token"
 touch "$T/gstate/revoked"
 python3 -I - "$DATA/gdrive.token" <<'EOF'

@@ -133,6 +133,8 @@ class H(BaseHTTPRequestHandler):
             if not f:
                 return self.send_json(404, {"error": {"code": 404, "message": "File not found"}})
             f["content"] = data
+            counters["uploads"] = counters.get("uploads", 0) + 1
+            f["modified"] = "2026-11-12T10:%02d:%02d.000Z" % (counters["uploads"] // 60 % 60, counters["uploads"] % 60)
         return self.send_json(200, {"id": m.group(1)})
 
     def do_GET(self):
@@ -149,9 +151,30 @@ class H(BaseHTTPRequestHandler):
             parent = parent.group(1) if parent else "root"
             with lock:
                 counters["api_calls"] += 1
+                if name is None:
+                    found = [{"id": i, "name": f["name"], "mimeType": f["mime"], "size": str(len(f["content"])),
+                              "modifiedTime": f.get("modified", "2026-11-12T10:00:00.000Z")}
+                             for i, f in store.items() if f["parent"] == parent]
+                    return self.send_json(200, {"files": found})
                 found = [{"id": i} for i, f in store.items()
                          if f["name"] == name and f["parent"] == parent and f["mime"].endswith("folder")]
             return self.send_json(200, {"files": found[:1]})
+        m = re.match(r"^/drive/v3/files/([^/]+)$", u.path)
+        if m and "alt=media" in (u.query or ""):
+            if not self.authed():
+                return
+            with lock:
+                counters["api_calls"] += 1
+                f = store.get(m.group(1))
+                data = f["content"] if f else None
+            if data is None:
+                return self.send_json(404, {"error": {"code": 404, "message": "File not found"}})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if u.path == "/_dump":
             with lock:
                 out = {"counters": dict(counters), "tokens": dict(tokens), "files": {}}

@@ -83,6 +83,36 @@ ui_set_due(double due) {
 }
 
 
+/* Snapshot of the running titles for the page (the real check stays in the
+ * main thread; title_activity.h is not thread safe). */
+static char ui_active[MAX_ACTIVE_TITLES][10];
+static size_t ui_active_count;
+static int ui_active_unknown;
+
+static void
+ui_sync_activity(void) {
+  activity_refresh(0);
+  pthread_mutex_lock(&ui_mutex);
+  ui_active_count = activity.count;
+  ui_active_unknown = activity.unknown;
+  memcpy(ui_active, activity.titles, sizeof ui_active);
+  pthread_mutex_unlock(&ui_mutex);
+}
+
+
+static int
+ui_title_active(const char *title) {
+  int active;
+
+  pthread_mutex_lock(&ui_mutex);
+  active = ui_active_unknown;
+  for(size_t i = 0; i < ui_active_count && !active; i++)
+    active = !strcmp(ui_active[i], title);
+  pthread_mutex_unlock(&ui_mutex);
+  return active;
+}
+
+
 /* Copies the main thread's selection into the shared snapshot. */
 static void
 ui_sync(void) {
@@ -272,6 +302,15 @@ usb_mark(const char *root, char *id_out) {
   logq("Marked %s as the backup USB (%s)", root, MARKER_NAME);
   return 0;
 }
+
+
+/* Restore jobs and listings (restore.h, included after this file). */
+typedef enum { JOB_NONE, JOB_RESTORE_PATH, JOB_RESTORE_SAVE, JOB_GDRIVE_DOWNLOAD } job_kind_t;
+static int job_submit(job_kind_t kind, const char *path, int ps5, const char *uid,
+                      const char *title, const char *save);
+static void job_status_json(jw_t *w);
+static void list_saves_json(jw_t *w);
+static void list_paths_json(jw_t *w);
 
 
 /* ------------------------------------------------------------------------
@@ -728,6 +767,62 @@ api_gdrive_connect(int c) {
 
 
 static void
+api_restore_list(int c) {
+  char *buf = malloc(WEB_MAX_BODY);
+  jw_t w = {buf, WEB_MAX_BODY, 0, 0};
+
+  if(!buf) {
+    web_message(c, "500 Internal Server Error", "error", "not enough memory");
+    return;
+  }
+  jw_raw(&w, "{\"saves\":");
+  if(g_backup_root[0]) list_saves_json(&w); else jw_raw(&w, "[]");
+  jw_raw(&w, ",\"files\":");
+  if(g_backup_root[0]) list_paths_json(&w); else jw_raw(&w, "[]");
+  jw_raw(&w, ",\"status\":");
+  job_status_json(&w);
+  jw_raw(&w, "}");
+  web_json(c, "200 OK", &w);
+  free(buf);
+}
+
+
+static void
+api_restore(int c, const char *body) {
+  char kind[16], path[PATH_MAX], ps[8], uid[64], title[16], save[256];
+  int rc;
+
+  form_get(body, "kind", kind, sizeof kind);
+  if(!strcmp(kind, "path")) {
+    if(!form_get(body, "path", path, sizeof path) || path[0] != '/') {
+      web_message(c, "400 Bad Request", "error", "path is missing");
+      return;
+    }
+    rc = job_submit(JOB_RESTORE_PATH, path, 0, NULL, NULL, NULL);
+  } else if(!strcmp(kind, "save")) {
+    form_get(body, "ps", ps, sizeof ps);
+    form_get(body, "uid", uid, sizeof uid);
+    form_get(body, "title", title, sizeof title);
+    form_get(body, "save", save, sizeof save);
+    if((strcmp(ps, "ps4") && strcmp(ps, "ps5")) || !is_hex_name(uid) || !title_valid(title) ||
+       !save[0] || strchr(save, '/') || save[0] == '.') {
+      web_message(c, "400 Bad Request", "error", "invalid save reference");
+      return;
+    }
+    rc = job_submit(JOB_RESTORE_SAVE, NULL, !strcmp(ps, "ps5"), uid, title, save);
+  } else {
+    web_message(c, "400 Bad Request", "error", "kind must be path or save");
+    return;
+  }
+  if(rc) {
+    web_message(c, "409 Conflict", "error", "another restore is still running");
+    return;
+  }
+  web_message(c, "202 Accepted", "ok", "Restore queued");
+}
+
+
+static void
 api_log(int c) {
   char *buf = malloc(UI_LOG_LINES * UI_LOG_WIDTH * 6 + 64);
   jw_t w = {buf, UI_LOG_LINES * UI_LOG_WIDTH * 6 + 64, 0, 0};
@@ -782,6 +877,23 @@ web_handle(int c) {
     gd_disconnect();
     ui_wake();
     web_message(c, "200 OK", "ok", "Signed out of Google Drive");
+  } else if(!strcmp(method, "GET") && !strcmp(path, "/api/restore/list")) {
+    api_restore_list(c);
+  } else if(!strcmp(method, "POST") && !strcmp(path, "/api/restore")) {
+    api_restore(c, body);
+  } else if(!strcmp(method, "GET") && !strcmp(path, "/api/restore/status")) {
+    char sbuf[2048];
+    jw_t w = {sbuf, sizeof sbuf, 0, 0};
+    job_status_json(&w);
+    web_json(c, "200 OK", &w);
+  } else if(!strcmp(method, "POST") && !strcmp(path, "/api/gdrive/download")) {
+    if(!gd_connected()) {
+      web_message(c, "400 Bad Request", "error", "Google Drive is not signed in");
+    } else if(job_submit(JOB_GDRIVE_DOWNLOAD, NULL, 0, NULL, NULL, NULL)) {
+      web_message(c, "409 Conflict", "error", "another restore is still running");
+    } else {
+      web_message(c, "202 Accepted", "ok", "Download queued");
+    }
   } else if(!strcmp(method, "GET") && !strcmp(path, "/api/log")) {
     api_log(c);
   } else {

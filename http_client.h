@@ -6,7 +6,7 @@
 #ifndef HTTP_CLIENT_H
 #define HTTP_CLIENT_H
 
-#define HTTP_MAX_RESPONSE (4 * 1024 * 1024)
+#define HTTP_MAX_RESPONSE (110 * 1024 * 1024)  /* downloads of files up to MAX_FILE_SZ */
 #define HTTP_USER_AGENT   APP_NAME "/" APP_VERSION
 #define HTTP_TIMEOUT_SEC  60
 

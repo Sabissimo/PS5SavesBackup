@@ -20,7 +20,7 @@ LDLIBS := -lSceFsInternalForVsh -lSceNotification -lSceSystemService -lSceUserSe
           -lSceNet -lSceSsl -lSceHttp2 -lpthread
 
 HEADERS := notification_icon.h backup_progress.h title_activity.h change_index.h \
-           usb_storage.h settings.h http_client.h gdrive.h web_ui.h web_page.h
+           usb_storage.h settings.h http_client.h gdrive.h web_ui.h restore.h web_page.h
 
 all: $(ELF)
 
@@ -59,6 +59,7 @@ test: $(HOST_BIN)
 	TEST_ROOT=$(TEST_ROOT) bash tests/usb_detection.sh $(HOST_BIN)
 	TEST_ROOT=$(TEST_ROOT) bash tests/web_ui.sh $(HOST_BIN)
 	TEST_ROOT=$(TEST_ROOT) bash tests/gdrive.sh $(HOST_BIN)
+	TEST_ROOT=$(TEST_ROOT) bash tests/restore.sh $(HOST_BIN)
 
 .PHONY: all clean test
 clean:

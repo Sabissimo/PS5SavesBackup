@@ -1091,4 +1091,260 @@ gd_sync(const char *root, const char *folder_name) {
   return 0;
 }
 
+
+/* ------------------------------------------------------------------------
+ * Download: Drive folder -> local backup folder (docs/RESTORE.md)
+ * ---------------------------------------------------------------------- */
+
+/* Calls fn for every object of the JSON array at key (one nesting level);
+ * obj is NUL terminated for the duration of the call. */
+static void
+json_each_object(const char *json, const char *key,
+                 void (*fn)(const char *obj, void *arg), void *arg) {
+  const char *v = json_value(json, key), *start = NULL;
+  int depth = 0, in_str = 0;
+
+  if(!v || *v != '[') return;
+  for(const char *p = v + 1; *p; p++) {
+    char c = *p;
+    if(in_str) {
+      if(c == '\\' && p[1]) p++;
+      else if(c == '"') in_str = 0;
+      continue;
+    }
+    if(c == '"') in_str = 1;
+    else if(c == '{') {
+      if(depth++ == 0) start = p;
+    } else if(c == '}') {
+      if(--depth == 0 && start) {
+        size_t len = (size_t)(p + 1 - start);
+        char *obj = malloc(len + 1);
+        if(obj) {
+          memcpy(obj, start, len);
+          obj[len] = 0;
+          fn(obj, arg);
+          free(obj);
+        }
+        start = NULL;
+      }
+    } else if(c == ']' && depth == 0) break;
+  }
+}
+
+
+/* "2026-11-12T10:00:00.000Z" -> time_t (UTC); 0 when unparsable. */
+static time_t
+parse_rfc3339(const char *s) {
+  struct tm tm;
+  int y, mo, d, h, mi, sec;
+
+  if(sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &sec) != 6) return 0;
+  memset(&tm, 0, sizeof tm);
+  tm.tm_year = y - 1900;
+  tm.tm_mon = mo - 1;
+  tm.tm_mday = d;
+  tm.tm_hour = h;
+  tm.tm_min = mi;
+  tm.tm_sec = sec;
+  return timegm(&tm);
+}
+
+
+typedef struct gd_dl {
+  const char *root;
+  const char *rel;              /* relative path of the folder being listed */
+  gd_sync_stats_t *stats;
+  int depth;
+} gd_dl_t;
+
+static int gd_dl_dir(const char *root, const char *folder_id, const char *rel,
+                     gd_sync_stats_t *stats, int depth);
+
+
+/* Writes resp body to path through .part + rename, keeping mtime. */
+static int
+gd_write_file(const char *path, const char *data, size_t len, time_t mtime) {
+  char part[PATH_MAX], dir[PATH_MAX], *slash;
+  int fd, ok = 0;
+  size_t pos = 0;
+
+  snprintf(dir, sizeof dir, "%s", path);
+  if((slash = strrchr(dir, '/')) && slash != dir) {
+    *slash = 0;
+    if(mkdir_p(dir)) return -1;
+  }
+  if(snprintf(part, sizeof part, "%s.part", path) >= (int)sizeof part) return -1;
+  if((fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) return -1;
+  while(pos < len) {
+    ssize_t w = write(fd, data + pos, len - pos);
+    if(w < 0) {
+      if(errno == EINTR) continue;
+      break;
+    }
+    pos += (size_t)w;
+  }
+  if(pos == len && !fsync(fd)) ok = 1;
+  if(close(fd)) ok = 0;
+  if(ok && mtime) {
+    struct timeval tv[2];
+    tv[0].tv_sec = mtime;
+    tv[0].tv_usec = 0;
+    tv[1] = tv[0];
+    utimes(part, tv);
+  }
+  if(!ok || rename(part, path)) {
+    unlink(part);
+    return -1;
+  }
+  return 0;
+}
+
+
+static void
+gd_dl_entry(const char *obj, void *arg) {
+  gd_dl_t *ctx = arg;
+  char id[GDRIVE_ID_LEN], name[512], mime[128], sizestr[32], modified[64], rel[PATH_MAX], local[PATH_MAX];
+  gd_entry_t *e;
+  struct stat st;
+  long long size;
+  time_t mtime;
+
+  if(ctx->stats->errors_in_a_row >= GDRIVE_MAX_ERRORS) return;
+  if(!json_get_string(obj, "id", id, sizeof id) || !json_get_string(obj, "name", name, sizeof name)) return;
+  if(!name[0] || strchr(name, '/') || !strcmp(name, ".") || !strcmp(name, "..")) return;
+  json_get_string(obj, "mimeType", mime, sizeof mime);
+  if(snprintf(rel, sizeof rel, "%s%s%s", ctx->rel, ctx->rel[0] ? "/" : "", name) >= (int)sizeof rel ||
+     snprintf(local, sizeof local, "%s/%s", ctx->root, rel) >= (int)sizeof local) return;
+
+  if(!strcmp(mime, GDRIVE_FOLDER_MIME)) {
+    if(ctx->depth > 64 || mkdir_p(local)) return;
+    if((e = gd_index_get(rel, 1))) {
+      snprintf(e->id, sizeof e->id, "%s", id);
+      e->dir = 1;
+      gd_index_dirty = 1;
+    }
+    gd_dl_dir(ctx->root, id, rel, ctx->stats, ctx->depth + 1);
+    return;
+  }
+  json_get_string(obj, "size", sizestr, sizeof sizestr);
+  size = strtoll(sizestr, NULL, 10);
+  json_get_string(obj, "modifiedTime", modified, sizeof modified);
+  mtime = parse_rfc3339(modified);
+  e = gd_index_get(rel, 0);
+  if(e && !e->dir && !strcmp(e->id, id) && e->size == size && !stat(local, &st) &&
+     S_ISREG(st.st_mode) && st.st_size == size) {
+    ctx->stats->skipped++;
+    return;                                  /* this very file was uploaded from here */
+  }
+  if(size > (long long)MAX_FILE_SZ) {
+    logq("Google Drive: %s is larger than the per-file limit; not downloaded", rel);
+    ctx->stats->skipped++;
+    return;
+  }
+  {
+    char url[512], err[256];
+    http_response_t resp;
+    snprintf(url, sizeof url, "%s/drive/v3/files/%s?alt=media", gd_api_base(), id);
+    if(gd_api("GET", url, NULL, NULL, 0, &resp, err, sizeof err) || resp.status != 200 ||
+       (long long)resp.len != size || gd_write_file(local, resp.body, resp.len, mtime)) {
+      if(resp.status >= 0 && resp.status != 200) snprintf(err, sizeof err, "download failed (HTTP %d)", resp.status);
+      else if(resp.status == 200 && (long long)resp.len != size) snprintf(err, sizeof err, "short download of %s", rel);
+      else if(resp.status == 200) snprintf(err, sizeof err, "cannot write %s", rel);
+      snprintf(ctx->stats->err, sizeof ctx->stats->err, "%s", err);
+      ctx->stats->failed++;
+      ctx->stats->errors_in_a_row++;
+      http_response_free(&resp);
+      return;
+    }
+    http_response_free(&resp);
+  }
+  if(!stat(local, &st) && (e || (e = gd_index_get(rel, 1)))) {
+    snprintf(e->id, sizeof e->id, "%s", id);
+    e->dir = 0;
+    e->size = st.st_size;
+    e->mtime = (int64_t)st.st_mtime;
+    gd_index_dirty = 1;
+  }
+  ctx->stats->uploaded++;                    /* counts downloaded files here */
+  ctx->stats->bytes += (uint64_t)size;
+  ctx->stats->errors_in_a_row = 0;
+  pthread_mutex_lock(&gd_mutex);
+  snprintf(gd_state.progress, sizeof gd_state.progress, "Downloading, %u file(s) so far", ctx->stats->uploaded);
+  pthread_mutex_unlock(&gd_mutex);
+}
+
+
+/* Lists one Drive folder (paged) and handles every entry. */
+static int
+gd_dl_dir(const char *root, const char *folder_id, const char *rel, gd_sync_stats_t *stats, int depth) {
+  char token[256] = "";
+  gd_dl_t ctx = {root, rel, stats, depth};
+
+  for(;;) {
+    char q[256], qenc[768], url[1536], tenc[768], err[256];
+    http_response_t resp;
+    snprintf(q, sizeof q, "'%s' in parents and trashed = false", folder_id);
+    url_encode(q, qenc, sizeof qenc);
+    url_encode(token, tenc, sizeof tenc);
+    snprintf(url, sizeof url, "%s/drive/v3/files?q=%s&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime)"
+             "&pageSize=1000&spaces=drive%s%s", gd_api_base(), qenc, token[0] ? "&pageToken=" : "", tenc);
+    if(gd_api("GET", url, NULL, NULL, 0, &resp, err, sizeof err)) {
+      snprintf(stats->err, sizeof stats->err, "%s", err);
+      stats->failed++;
+      stats->errors_in_a_row = GDRIVE_MAX_ERRORS;
+      return -1;
+    }
+    if(resp.status != 200) {
+      snprintf(stats->err, sizeof stats->err, "Google Drive listing failed (HTTP %d)", resp.status);
+      stats->failed++;
+      stats->errors_in_a_row = GDRIVE_MAX_ERRORS;
+      http_response_free(&resp);
+      return -1;
+    }
+    json_each_object(resp.body, "files", gd_dl_entry, &ctx);
+    json_get_string(resp.body, "nextPageToken", token, sizeof token);
+    http_response_free(&resp);
+    if(!token[0] || stats->errors_in_a_row >= GDRIVE_MAX_ERRORS) break;
+  }
+  return stats->errors_in_a_row >= GDRIVE_MAX_ERRORS ? -1 : 0;
+}
+
+
+/**
+ * Fills the local backup folder from the Drive folder: files that are not
+ * known to be identical locally are downloaded. Local extras are kept.
+ **/
+static int
+gd_download(const char *root, const char *folder_name, char *err, size_t elen) {
+  gd_sync_stats_t stats;
+  char root_id[GDRIVE_ID_LEN], size[32];
+  double start = now_seconds();
+  int rc;
+
+  memset(&stats, 0, sizeof stats);
+  if(!gd_connected()) {
+    snprintf(err, elen, "Google Drive is not signed in");
+    return -1;
+  }
+  if(!folder_name[0]) folder_name = GDRIVE_DEFAULT_FOLDER;
+  if(gd_root_folder(folder_name, root_id, err, elen)) return -1;
+  gd_index_load(root_id);
+  logq("Google Drive: downloading folder %s to %s", folder_name, root);
+  rc = gd_dl_dir(root, root_id, "", &stats, 0);
+  gd_index_save(root_id);
+  gd_index_clear();
+  format_size(stats.bytes, size, sizeof size);
+  pthread_mutex_lock(&gd_mutex);
+  gd_state.progress[0] = 0;
+  pthread_mutex_unlock(&gd_mutex);
+  logq("Google Drive: %u file(s) downloaded (%s), %u already present, %u failed in %.1f seconds",
+       stats.uploaded, size, stats.skipped, stats.failed, now_seconds() - start);
+  if(rc || stats.failed) {
+    snprintf(err, elen, "%s (%u downloaded, %u failed)", stats.err, stats.uploaded, stats.failed);
+    return -1;
+  }
+  snprintf(err, elen, "%u file(s) downloaded (%s), %u already present", stats.uploaded, size, stats.skipped);
+  return 0;
+}
+
 #endif

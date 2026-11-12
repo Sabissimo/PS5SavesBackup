@@ -109,6 +109,18 @@
     </form>
   </section>
 
+  <section id="restore">
+    <h2>Restore</h2>
+    <p class="hint">Copies files from the backup back to the console. A save is rebuilt from its backed-up files; the game must not be running, and a copy of the save as it was is kept in the backup folder under <code>restore_undo/</code>.</p>
+    <h3 style="font-size:17px;margin:14px 0 6px">Game saves</h3>
+    <table><thead><tr><th>Game</th><th>Save</th><th>User</th><th>Backed up</th><th>State</th><th></th></tr></thead><tbody id="rsaves"></tbody></table>
+    <h3 style="font-size:17px;margin:14px 0 6px">Files and folders</h3>
+    <table><thead><tr><th>Path</th><th>Backed up</th><th>State</th><th></th></tr></thead><tbody id="rfiles"></tbody></table>
+    <div class="actions"><button id="gdDownload" class="secondary">Download the backup from Google Drive</button></div>
+    <div class="msg" id="rMsg"></div>
+    <div class="row" style="margin-top:6px"><span class="kv" id="rStatus"></span></div>
+  </section>
+
   <section id="logsec">
     <h2>Log</h2>
     <pre id="log"></pre>
@@ -191,6 +203,46 @@
       $('gdrive').checked = c.gdrive; $('gdrive_folder').value = c.gdrive_folder;
     });
   }
+  function fmtWhen(t) { return t ? new Date(t * 1000).toLocaleString() : '-'; }
+  function restoreBtn(label, params, prompt) {
+    var b = document.createElement('button'); b.textContent = label; b.className = 'secondary'; b.style.padding = '6px 12px';
+    b.addEventListener('click', function () {
+      if (!confirm(prompt)) return;
+      post('/api/restore', params).then(function (j) { note($('rMsg'), j); setTimeout(restoreList, 1000); });
+    });
+    return b;
+  }
+  function restoreList() {
+    return get('/api/restore/list').then(function (r) {
+      var ts = $('rsaves'); ts.innerHTML = '';
+      r.saves.forEach(function (s) {
+        var tr = document.createElement('tr');
+        var state = s.running ? 'game running' : !s.slot_exists ? 'no save slot on this console' : 'ready';
+        tr.innerHTML = '<td>' + s.ps.toUpperCase() + ' ' + s.title + '</td><td>' + s.save + '</td><td>' + s.uid + '</td><td>' + fmtWhen(s.backed_up) + ' (' + s.files + ' files, ' + fmtBytes(s.bytes) + ')</td><td>' + state + '</td><td></td>';
+        var p = new URLSearchParams(); p.set('kind', 'save'); p.set('ps', s.ps); p.set('uid', s.uid); p.set('title', s.title); p.set('save', s.save);
+        var b = restoreBtn('Restore', p, 'Replace the current ' + s.ps.toUpperCase() + ' save ' + s.title + '/' + s.save + ' with the backup? The current save is kept as an undo copy.');
+        b.disabled = s.running || !s.slot_exists || r.status.busy;
+        tr.lastChild.appendChild(b); ts.appendChild(tr);
+      });
+      if (!r.saves.length) ts.innerHTML = '<tr><td colspan="6">No game saves in the backup</td></tr>';
+      var tf = $('rfiles'); tf.innerHTML = '';
+      r.files.forEach(function (f) {
+        var tr = document.createElement('tr');
+        var state = !f.in_backup ? 'not in the backup yet' : f.running ? 'application running' : 'ready';
+        tr.innerHTML = '<td>' + f.path + '</td><td>' + (f.in_backup ? fmtWhen(f.backed_up) + ' (' + f.files + ' files, ' + fmtBytes(f.bytes) + ')' : '-') + '</td><td>' + state + '</td><td></td>';
+        var p = new URLSearchParams(); p.set('kind', 'path'); p.set('path', f.path);
+        var b = restoreBtn('Restore', p, 'Copy ' + f.path + ' back from the backup? Existing files are overwritten.');
+        b.disabled = !f.in_backup || f.running || r.status.busy;
+        tr.lastChild.appendChild(b); tf.appendChild(tr);
+      });
+      if (!r.files.length) tf.innerHTML = '<tr><td colspan="4">No files configured</td></tr>';
+      var st = r.status, txt = '';
+      if (st.busy) txt = st.job + (st.step ? ': ' + st.step : '') + '...';
+      else if (st.last) txt = st.last + ': ' + (st.last_ok ? st.result : 'failed, ' + st.error) + ' (' + fmtAge(st.finished_age) + ')';
+      $('rStatus').textContent = txt;
+      $('gdDownload').disabled = st.busy;
+    });
+  }
   function log() {
     return get('/api/log').then(function (l) {
       var pre = $('log'), atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
@@ -230,12 +282,16 @@
   $('gdDisconnect').addEventListener('click', function () {
     post('/api/gdrive/disconnect').then(function (j) { note($('gdMsg'), j); return gdrive(); });
   });
+  $('gdDownload').addEventListener('click', function () {
+    if (!confirm('Download the backup folder from Google Drive into the local backup? Local files are not deleted.')) return;
+    post('/api/gdrive/download').then(function (j) { note($('rMsg'), j); setTimeout(restoreList, 1000); });
+  });
   $('backupNow').addEventListener('click', function () {
     post('/api/backup').then(function () { setTimeout(function () { status(); log(); }, 1500); });
   });
 
-  status().then(mounts).then(config).then(gdrive).then(log);
-  setInterval(function () { status(); gdrive(); log(); }, 5000);
+  status().then(mounts).then(config).then(gdrive).then(restoreList).then(log);
+  setInterval(function () { status(); gdrive(); log(); restoreList(); }, 5000);
   setInterval(mounts, 15000);
 })();
 </script>

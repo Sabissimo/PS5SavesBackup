@@ -9,6 +9,7 @@ PS5SavesBackup is a background payload that keeps copies of your game saves and 
 - **Settings page**: everything is configured from a web page served by the payload, opened in the console browser or from your phone or PC. No more editing files by hand.
 - **Any USB layout**: the backup partition is picked on the settings page and found again at every start, whatever `/mnt/usbN` number it gets. Multi-partition drives (for example a Linux boot partition plus an exFAT backup partition) work.
 - **Google Drive**: backups can also go to your own Google Drive, with or without a USB. Sign in from the settings page with a short code typed on your phone; the app only ever sees the files it created itself.
+- **Restore**: every backed-up save and file can be put back from the settings page, with an undo copy of the save as it was. A console without a backup can download it from Google Drive first.
 
 <img width="1280" height="720" alt="Notification screenshot" src="https://github.com/user-attachments/assets/cbef0c27-b218-4da1-943c-f6c0da6e0ef4" />
 
@@ -56,6 +57,16 @@ Startup log (klog):
 [PS5SavesBackup] Backup destination: /mnt/usb2/backup
 [PS5SavesBackup] Starting backup service...
 ```
+
+# Restoring
+
+The "Restore" section of the settings page lists the game saves and the files in the backup. "Restore" on a plain file or folder copies it back to its original path (files are written through a temporary name, existing files are overwritten, extra files are left alone). "Restore" on a save rebuilds the save from the backed-up files:
+
+1. The game must not be running or suspended, and the save slot must exist on the console (start the game once and save, if it never ran on this console).
+2. The current save image is copied to `backup/restore_undo/<ps4|ps5>/<user>/<title>/<save>.<time>` first (the three newest copies per save are kept), so a restore can be undone by hand.
+3. A working copy of the image is mounted, its content replaced by the backup, and the new image is swapped in by rename. The original is never edited in place.
+
+"Download the backup from Google Drive" fills the local backup folder from the Drive folder (files already present locally are skipped, local extras are kept); after that everything in it can be restored. Restores run between backup passes, one at a time; progress and the result are shown in the section and in the log.
 
 # Settings reference
 
@@ -176,4 +187,4 @@ The USB detection, the settings page and the Google Drive upload can be exercise
 make test
 ```
 
-`tests/usb_detection.sh` covers: legacy configuration on usb0, usb1, usb2 and usb10 (numeric order), several partitions with only one `backup.conf`, several with one (lowest number wins), no configuration, a read-only partition, a USB unplugged while running, sources overlapping the destination, and selection by marker id (ignoring legacy files, marked USB not connected, no selection). `tests/web_ui.sh` covers the page and its API: status, migration from a legacy `backup.conf`, validation, switching the USB, "back up now", the log, and first start without any configuration. `tests/gdrive.sh` runs against `tests/fake_google.py`, a stand-in for Google's OAuth and Drive endpoints: device-code sign-in, upload of a folder tree, unchanged/changed/remotely deleted files, retries on server errors, access token refresh, a renamed Drive folder, USB plus Drive, a revoked token, a declined sign-in, sign-out and an unreachable server. The read-only and unplug scenarios use real tmpfs mounts and therefore need root; run `VERBOSE=1 make test` to print the payload log of a failed check.
+`tests/usb_detection.sh` covers: legacy configuration on usb0, usb1, usb2 and usb10 (numeric order), several partitions with only one `backup.conf`, several with one (lowest number wins), no configuration, a read-only partition, a USB unplugged while running, sources overlapping the destination, and selection by marker id (ignoring legacy files, marked USB not connected, no selection). `tests/web_ui.sh` covers the page and its API: status, migration from a legacy `backup.conf`, validation, switching the USB, "back up now", the log, and first start without any configuration. `tests/gdrive.sh` runs against `tests/fake_google.py`, a stand-in for Google's OAuth and Drive endpoints: device-code sign-in, upload of a folder tree, unchanged/changed/remotely deleted files, retries on server errors, access token refresh, a renamed Drive folder, USB plus Drive, download onto a console without a backup, a revoked token, a declined sign-in, sign-out and an unreachable server. `tests/restore.sh` covers restoring plain files and folders, refusal while the application is running, and PS5/PS4 save restore with undo copies; the host stubs simulate save images as tar archives (mount extracts, unmount re-packs). The read-only and unplug scenarios use real tmpfs mounts and therefore need root; run `VERBOSE=1 make test` to print the payload log of a failed check.

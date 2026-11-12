@@ -38,13 +38,35 @@ sceNotificationSend(int user_id, bool is_logged, const char *payload) {
 
 int sceKernelGetAppInfo(pid_t pid, void *info) { (void)pid; (void)info; return -1; }
 
+/* Save images are simulated as tar archives: mounting extracts the archive
+ * into the mount point, unmounting writes the mount point back into the
+ * archive (the mount is read-write, like on the console). */
+#include <stdlib.h>
+#include <sys/stat.h>
+static char mounted_image[4096];
+
 int sceFsInitMountSaveDataOpt(void *opt) { (void)opt; return 0; }
 int sceFsMountSaveData(void *opt, const char *path, const char *mount, uint8_t *key) {
-  (void)opt; (void)path; (void)mount; (void)key; return -1;
+  char cmd[9000];
+  struct stat st;
+  (void)opt; (void)key;
+  if(mounted_image[0] || stat(path, &st) || !S_ISREG(st.st_mode)) return -1;
+  mkdir(mount, 0777);
+  snprintf(cmd, sizeof cmd, "tar -xf '%s' -C '%s'", path, mount);
+  if(system(cmd)) return -1;
+  snprintf(mounted_image, sizeof mounted_image, "%s", path);
+  return 0;
 }
 int sceFsInitUmountSaveDataOpt(void *opt) { (void)opt; return 0; }
 int sceFsUmountSaveData(void *opt, const char *mount, int handle, int ignore) {
-  (void)opt; (void)mount; (void)handle; (void)ignore; return -1;
+  char cmd[9000];
+  (void)opt; (void)handle; (void)ignore;
+  if(!mounted_image[0]) return -1;
+  snprintf(cmd, sizeof cmd, "tar -cf '%s' -C '%s' . && rm -rf '%s'/* '%s'/.[!.]*",
+           mounted_image, mount, mount, mount);
+  if(system(cmd)) return -1;
+  mounted_image[0] = 0;
+  return 0;
 }
 
 /* Settings page: the console browser cannot be opened on the host. */

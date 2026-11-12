@@ -295,6 +295,7 @@ static void ui_set_state(const char *state, const char *reason);
 static void ui_set_result(const char *fmt, ...);
 static void ui_set_due(double due);
 static void ui_wake(void);
+static void ui_sync_activity(void);
 
 /* Escape every JSON control character and reject overflow rather than emit
  * truncated or malformed JSON. UTF-8 bytes are preserved. */
@@ -1060,6 +1061,13 @@ decrypt_key(const uint8_t *sealed, uint8_t key[0x20]) {
   uint8_t *data;
   int fd;
   int rc;
+
+#ifdef BACKUP_HOST_TEST
+  /* the host test "images" are plain archives without a sealed key */
+  (void)sealed;
+  memset(key, 0, 0x20);
+  return 0;
+#endif
 
   if(!(data = calloc(1, 0x100))) {
     return -1;
@@ -2383,6 +2391,7 @@ wait_until(double due, int lock) {
     double remaining = due - now_seconds();
     if(remaining <= 0) return 0;
     int slice = pending_titles ? CLOSE_POLL_SEC : SLICE_SEC;
+    ui_sync_activity();
     if(pending_ready()) return 2;
     int ms = remaining > slice ? slice * 1000 : (int)(remaining * 1000) + 1;
     struct pollfd pfd[2] = {{lock, POLLIN, 0}, {g_wake_pipe[0], POLLIN, 0}};
@@ -2405,6 +2414,7 @@ wait_until(double due, int lock) {
 #include "settings.h"
 #include "gdrive.h"
 #include "web_ui.h"
+#include "restore.h"
 
 
 /**
@@ -2578,6 +2588,9 @@ main(void) {
             }
           }
         }
+        if(job_pending()) {
+          job_run();
+        }
         ui_set_state("waiting", why);
         ui_set_due(0);
 #ifdef BACKUP_HOST_TEST
@@ -2603,6 +2616,13 @@ main(void) {
     if(wake == 1) {
       notify("Previous backup instance stopped.");
       break;
+    }
+
+    /* restore or download requested on the settings page */
+    if(job_pending()) {
+      job_run();
+      ui_set_state("running", "");
+      if(wake == 3) continue;
     }
 
     /* the settings page may have moved the backups to another USB */

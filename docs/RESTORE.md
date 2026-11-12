@@ -54,9 +54,10 @@ same privilege elevation as the backup.
 4. Undo copy: the current image (and .bin) is copied to
    `backup/restore_undo/<ps>/<uid>/<title>/<save>.<unix time>` before
    anything else. The three newest undo copies per save are kept.
-5. Working copy: the image is copied to `TMP_DIR/_restore_tmp_image`, the key
-   is unsealed through pfsmgr like for a backup, and the copy is mounted at
-   `PFS_ROOT/saverestore_tmp` (read-write).
+5. Working copy: the image is copied to `TMP_DIR/_backup_tmp_image` (the
+   same temporary paths as the backup, which never runs at the same time),
+   the key is unsealed through pfsmgr like for a backup, and the copy is
+   mounted at `PFS_ROOT/savebackup_tmp` (read-write).
 6. The mounted content is replaced by the backup: every file below the
    mount is removed (except nothing: sce_sys is in the backup as well), then
    the backup files are copied in. Files are copied to `.part` first.
@@ -106,14 +107,14 @@ copies the mount point back. `decrypt_key` is a no-op on the host.
   download does nothing, upload after download does nothing
 
 ## Checklist
-- [ ] docs committed
-- [ ] restore.h: job queue, plain file restore
-- [ ] restore.h: save restore with undo copy and atomic swap
-- [ ] host stubs: simulated save mount, decrypt no-op
-- [ ] web UI: Restore section, list and buttons
-- [ ] gdrive.h: download (reverse mirror), fake server endpoints
-- [ ] tests/restore.sh, tests/gdrive.sh download scenario
-- [ ] README section "Restoring"
+- [x] docs committed
+- [x] restore.h: job queue, plain file restore
+- [x] restore.h: save restore with undo copy and atomic swap
+- [x] host stubs: simulated save mount, decrypt no-op
+- [x] web UI: Restore section, list and buttons
+- [x] gdrive.h: download (reverse mirror), fake server endpoints
+- [x] tests/restore.sh, tests/gdrive.sh download scenario
+- [x] README section "Restoring"
 - [ ] console check: PS5 save restore on a throw-away game
 - [ ] console check: PS4 save restore
 - [ ] console check: download from Drive on a console without a backup
