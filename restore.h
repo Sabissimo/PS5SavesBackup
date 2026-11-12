@@ -9,7 +9,6 @@
 #ifndef RESTORE_H
 #define RESTORE_H
 
-#define UNDO_DIR          "restore_undo"
 #define UNDO_KEEP         3            /* undo copies kept per save */
 #define NEW_IMAGE_SUFFIX  ".ps5sbnew"  /* new image next to the original before the swap */
 
@@ -23,6 +22,7 @@ static struct {
   char uid[64];
   char title[16];
   char save[256];
+  char source[160];
   char step[160];
   char result[256];
   char error[256];
@@ -44,9 +44,32 @@ job_pending(void) {
 
 
 /* Queues one job. Returns -1 when another job is queued or running. */
+/* "" = the live backup, "daily/<YYYY-MM-DD>" = a daily snapshot,
+ * "history/<version>" = a previous version of a save. */
+static int
+restore_source_valid(const char *source) {
+  if(!source[0]) return 1;
+  if(!strncmp(source, "daily/", 6)) return is_date_name(source + 6);
+  if(!strncmp(source, "history/", 8)) {
+    const char *v = source + 8;
+    if(strlen(v) > 40 || !history_version_time(v)) return 0;
+    for(const char *p = v; *p; p++) if(!isalnum((unsigned char)*p) && *p != '-' && *p != '_') return 0;
+    return 1;
+  }
+  return 0;
+}
+
+
+static const char *
+source_label(const char *source) {
+  if(!source[0]) return "the latest backup";
+  return source;
+}
+
+
 static int
 job_submit(job_kind_t kind, const char *path, int ps5, const char *uid,
-           const char *title, const char *save) {
+           const char *title, const char *save, const char *source) {
   pthread_mutex_lock(&job_mutex);
   if(job.queued || job.running) {
     pthread_mutex_unlock(&job_mutex);
@@ -59,14 +82,15 @@ job_submit(job_kind_t kind, const char *path, int ps5, const char *uid,
   snprintf(job.uid, sizeof job.uid, "%s", uid ? uid : "");
   snprintf(job.title, sizeof job.title, "%s", title ? title : "");
   snprintf(job.save, sizeof job.save, "%s", save ? save : "");
+  snprintf(job.source, sizeof job.source, "%s", source ? source : "");
   job.step[0] = job.result[0] = job.error[0] = 0;
   switch(kind) {
   case JOB_RESTORE_PATH:
-    snprintf(job.last_label, sizeof job.last_label, "Restore %s", job.path);
+    snprintf(job.last_label, sizeof job.last_label, "Restore %s from %s", job.path, source_label(job.source));
     break;
   case JOB_RESTORE_SAVE:
-    snprintf(job.last_label, sizeof job.last_label, "Restore %s save %s/%s (user %s)",
-             ps5 ? "PS5" : "PS4", job.title, job.save, job.uid);
+    snprintf(job.last_label, sizeof job.last_label, "Restore %s save %s/%s (user %s) from %s",
+             ps5 ? "PS5" : "PS4", job.title, job.save, job.uid, source_label(job.source));
     break;
   case JOB_GDRIVE_DOWNLOAD:
     snprintf(job.last_label, sizeof job.last_label, "Download from Google Drive");
@@ -215,12 +239,19 @@ restore_tree(const char *src, const char *dst, unsigned *copied, unsigned *faile
 }
 
 
-/* Restores one path (file or folder) from backup/<path>. */
+/* Restores one path (file or folder) from backup/<path> or a daily snapshot. */
 static int
-restore_path(const char *path, char *err, size_t elen) {
-  char norm[PATH_MAX], src[PATH_MAX], why[160];
+restore_path(const char *path, const char *source, char *err, size_t elen) {
+  char norm[PATH_MAX], src[PATH_MAX], base[PATH_MAX], why[160];
   struct stat st;
   unsigned copied = 0, failed = 0;
+
+  if(!source[0]) snprintf(base, sizeof base, "%s", g_backup_root);
+  else if(!strncmp(source, "daily/", 6)) snprintf(base, sizeof base, "%s/%s", g_daily_root, source + 6);
+  else {
+    snprintf(err, elen, "files have no version history; use the latest backup or a daily snapshot");
+    return -1;
+  }
 
   if(!path_normalize(path, norm, sizeof norm) || !strcmp(norm, "/")) {
     snprintf(err, elen, "invalid path");
@@ -234,15 +265,15 @@ restore_path(const char *path, char *err, size_t elen) {
     snprintf(err, elen, "the application using %s is running (%s)", norm, why);
     return -1;
   }
-  if(snprintf(src, sizeof src, "%s%s", g_backup_root, norm) >= (int)sizeof src) {
+  if(snprintf(src, sizeof src, "%s%s", base, norm) >= (int)sizeof src) {
     snprintf(err, elen, "path too long");
     return -1;
   }
   if(lstat(src, &st)) {
-    snprintf(err, elen, "%s is not in the backup", norm);
+    snprintf(err, elen, "%s is not in %s", norm, source_label(source));
     return -1;
   }
-  job_step("copying %s back", norm);
+  job_step("copying %s back from %s", norm, source_label(source));
   if(S_ISDIR(st.st_mode)) {
     restore_tree(src, norm, &copied, &failed);
   } else if(S_ISREG(st.st_mode)) {
@@ -352,7 +383,8 @@ mount_clear(void) {
  * while the title is running; see docs/RESTORE.md for the sequence.
  **/
 static int
-restore_save(int ps5, const char *uid, const char *title, const char *save, char *err, size_t elen) {
+restore_save(int ps5, const char *uid, const char *title, const char *save,
+             const char *source, char *err, size_t elen) {
   char image[PATH_MAX], bin[PATH_MAX], backup_dir[PATH_MAX], undo_dir[PATH_MAX];
   char undo[PATH_MAX], newimg[PATH_MAX], stamp[PATH_MAX], why[160], a[32];
   uint8_t sealed[0x60], key[0x20];
@@ -367,10 +399,18 @@ restore_save(int ps5, const char *uid, const char *title, const char *save, char
     snprintf(err, elen, "invalid save reference");
     return -1;
   }
-  snprintf(backup_dir, sizeof backup_dir, "%s/saves/%s/%s/%s/%s", g_backup_root,
-           ps5 ? "ps5" : "ps4", uid, title, save);
+  if(!source[0]) {
+    snprintf(backup_dir, sizeof backup_dir, "%s/saves/%s/%s/%s/%s", g_backup_root,
+             ps5 ? "ps5" : "ps4", uid, title, save);
+  } else if(!strncmp(source, "daily/", 6)) {
+    snprintf(backup_dir, sizeof backup_dir, "%s/%s/saves/%s/%s/%s/%s", g_daily_root, source + 6,
+             ps5 ? "ps5" : "ps4", uid, title, save);
+  } else {
+    snprintf(backup_dir, sizeof backup_dir, "%s/%s/%s/%s/%s/%s/%s", g_backup_root, HISTORY_DIR,
+             ps5 ? "ps5" : "ps4", uid, title, save, source + 8);
+  }
   if(stat(backup_dir, &st) || !S_ISDIR(st.st_mode)) {
-    snprintf(err, elen, "this save is not in the backup");
+    snprintf(err, elen, "this save is not in %s", source_label(source));
     return -1;
   }
   save_image_paths(ps5, uid, title, save, image, sizeof image, bin, sizeof bin);
@@ -523,8 +563,8 @@ restore_save(int ps5, const char *uid, const char *title, const char *save, char
   unlink(stamp);
   format_size(bytes, a, sizeof a);
   pthread_mutex_lock(&job_mutex);
-  snprintf(job.result, sizeof job.result, "%s save %s/%s restored (%s); previous save kept as %s",
-           ps5 ? "PS5" : "PS4", title, save, a, undo + strlen(g_backup_root) + 1);
+  snprintf(job.result, sizeof job.result, "%s save %s/%s restored from %s (%s); previous save kept as %s",
+           ps5 ? "PS5" : "PS4", title, save, source_label(source), a, undo + strlen(g_backup_root) + 1);
   pthread_mutex_unlock(&job_mutex);
   rc = 0;
 
@@ -564,6 +604,58 @@ dir_stats(const char *dir, unsigned *files, uint64_t *bytes, time_t *newest) {
     }
   }
   closedir(d);
+}
+
+
+/* JSON array of the sources a save can be restored from: history versions
+ * (newest first) and daily snapshots that contain it. */
+static void
+list_versions_json(jw_t *w, const char *ps, const char *uid, const char *title, const char *save) {
+  char dir[PATH_MAX], path[PATH_MAX];
+  char (*names)[64] = malloc(256 * sizeof *names);
+  struct dirent *dp;
+  struct stat st;
+  int n = 0, first = 1;
+  DIR *d;
+
+  jw_raw(w, "[");
+  if(!names) {
+    jw_raw(w, "]");
+    return;
+  }
+  snprintf(dir, sizeof dir, "%s/%s/%s/%s/%s/%s", g_backup_root, HISTORY_DIR, ps, uid, title, save);
+  if((d = opendir(dir))) {
+    while((dp = readdir(d)) && n < 256) {
+      if(dp->d_name[0] == '.' || strlen(dp->d_name) >= 64 || !history_version_time(dp->d_name)) continue;
+      snprintf(names[n++], 64, "%s", dp->d_name);
+    }
+    closedir(d);
+  }
+  qsort(names, n, sizeof *names, cmp_desc);
+  for(int i = 0; i < n; i++) {
+    jw_raw(w, first ? "{" : ",{");
+    first = 0;
+    jw_raw(w, "\"id\":\"history/%s\",\"label\":\"version %s\",\"time\":%lld}", names[i], names[i],
+           (long long)history_version_time(names[i]));
+  }
+  n = 0;
+  if((d = opendir(g_daily_root))) {
+    while((dp = readdir(d)) && n < 256) {
+      if(!is_date_name(dp->d_name)) continue;
+      if(snprintf(path, sizeof path, "%s/%s/saves/%s/%s/%s/%s", g_daily_root, dp->d_name, ps, uid, title, save) >= (int)sizeof path ||
+         stat(path, &st) || !S_ISDIR(st.st_mode)) continue;
+      snprintf(names[n++], 64, "%s", dp->d_name);
+    }
+    closedir(d);
+  }
+  qsort(names, n, sizeof *names, cmp_desc);
+  for(int i = 0; i < n; i++) {
+    jw_raw(w, first ? "{" : ",{");
+    first = 0;
+    jw_raw(w, "\"id\":\"daily/%s\",\"label\":\"daily snapshot %s\",\"time\":0}", names[i], names[i]);
+  }
+  jw_raw(w, "]");
+  free(names);
 }
 
 
@@ -619,6 +711,8 @@ list_saves_json(jw_t *w) {
           jw_field_num(w, "backed_up", (long long)(stamped ? stamped : newest), 1);
           jw_field_bool(w, "slot_exists", !stat(image, &ist) && S_ISREG(ist.st_mode), 1);
           jw_field_bool(w, "running", ui_title_active(td->d_name), 1);
+          jw_raw(w, ",\"versions\":");
+          list_versions_json(w, ps[p], ud->d_name, td->d_name, sd->d_name);
           jw_raw(w, "}");
         }
         closedir(saves);
@@ -678,6 +772,25 @@ list_paths_json(jw_t *w) {
       jw_field_num(w, "backed_up", (long long)newest, 1);
       jw_field_bool(w, "running", path_title_running(norm, why, sizeof why, 0), 1);
     }
+    {
+      char dpath[PATH_MAX];
+      struct dirent *dp;
+      struct stat dst;
+      DIR *d;
+      int firstv = 1;
+      jw_raw(w, ",\"versions\":[");
+      if((d = opendir(g_daily_root))) {
+        while((dp = readdir(d))) {
+          if(!is_date_name(dp->d_name)) continue;
+          if(snprintf(dpath, sizeof dpath, "%s/%s%s", g_daily_root, dp->d_name, norm) >= (int)sizeof dpath ||
+             lstat(dpath, &dst)) continue;
+          jw_raw(w, "%s{\"id\":\"daily/%s\",\"label\":\"daily snapshot %s\"}", firstv ? "" : ",", dp->d_name, dp->d_name);
+          firstv = 0;
+        }
+        closedir(d);
+      }
+      jw_raw(w, "]");
+    }
     jw_raw(w, "}");
   }
   jw_raw(w, "]");
@@ -692,7 +805,7 @@ list_paths_json(jw_t *w) {
 static void
 job_run(void) {
   job_kind_t kind;
-  char path[PATH_MAX], uid[64], title[16], save[256], err[256] = "";
+  char path[PATH_MAX], uid[64], title[16], save[256], source[160], err[256] = "";
   int ps5, rc;
 
   pthread_mutex_lock(&job_mutex);
@@ -708,6 +821,7 @@ job_run(void) {
   snprintf(uid, sizeof uid, "%s", job.uid);
   snprintf(title, sizeof title, "%s", job.title);
   snprintf(save, sizeof save, "%s", job.save);
+  snprintf(source, sizeof source, "%s", job.source);
   pthread_mutex_unlock(&job_mutex);
 
   logq("Restore: %s", job.last_label);
@@ -717,10 +831,10 @@ job_run(void) {
     rc = -1;
   } else switch(kind) {
   case JOB_RESTORE_PATH:
-    rc = restore_path(path, err, sizeof err);
+    rc = restore_path(path, source, err, sizeof err);
     break;
   case JOB_RESTORE_SAVE:
-    rc = restore_save(ps5, uid, title, save, err, sizeof err);
+    rc = restore_save(ps5, uid, title, save, source, err, sizeof err);
     break;
   case JOB_GDRIVE_DOWNLOAD:
     rc = gd_download(g_backup_root, g_gdrive_folder, err, sizeof err);

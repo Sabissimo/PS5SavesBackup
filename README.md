@@ -9,7 +9,7 @@ PS5SavesBackup is a background payload that keeps copies of your game saves and 
 - **Settings page**: everything is configured from a web page served by the payload, opened in the console browser or from your phone or PC. No more editing files by hand.
 - **Any USB layout**: the backup partition is picked on the settings page and found again at every start, whatever `/mnt/usbN` number it gets. Multi-partition drives (for example a Linux boot partition plus an exFAT backup partition) work.
 - **Google Drive**: backups can also go to your own Google Drive, with or without a USB. Sign in from the settings page with a short code typed on your phone; the app only ever sees the files it created itself.
-- **Restore**: every backed-up save and file can be put back from the settings page, with an undo copy of the save as it was. A console without a backup can download it from Google Drive first.
+- **Restore and versions**: every backed-up save and file can be put back from the settings page, from the latest backup, from a previous version of the save (kept for a few days, in Google Drive too) or from a daily snapshot, with an undo copy of the save as it was. A console without a backup can download it from Google Drive first.
 
 <img width="1280" height="720" alt="Notification screenshot" src="https://github.com/user-attachments/assets/cbef0c27-b218-4da1-943c-f6c0da6e0ef4" />
 
@@ -40,7 +40,9 @@ PS4/PS5 saves are backed up while in-game except for the game you are currently 
 ```
 PS5SavesBackup.id     marker
 backup/               live backup: <original path> for files, saves/ps5/<user>/<title>/... for saves
-backup_daily/         dated snapshots YYYY-MM-DD (console local date)
+backup/history/       previous versions of saves, <ps>/<user>/<title>/<save>/<YYYY-MM-DD_HHMMSS>/
+backup/restore_undo/  save images replaced by a restore (local only)
+backup_daily/         dated snapshots YYYY-MM-DD (console local date), without history and undo copies
 ```
 
 Startup log (klog):
@@ -66,6 +68,8 @@ The "Restore" section of the settings page lists the game saves and the files in
 2. The current save image is copied to `backup/restore_undo/<ps4|ps5>/<user>/<title>/<save>.<time>` first (the three newest copies per save are kept), so a restore can be undone by hand.
 3. A working copy of the image is mounted, its content replaced by the backup, and the new image is swapped in by rename. The original is never edited in place.
 
+**Versions.** Every time a changed save is backed up, the previous copy moves to `backup/history/<ps4|ps5>/<user>/<title>/<save>/<YYYY-MM-DD_HHMMSS>/` and is offered in the "Version" list of the Restore section. Versions older than `history_days_to_keep` days (3 by default, 0 turns history off) are removed after each pass, in Google Drive as well; the history itself is uploaded with the backup, undo copies are not. Daily snapshots that contain the save are offered as sources too, and plain files can be restored from a daily snapshot.
+
 "Download the backup from Google Drive" fills the local backup folder from the Drive folder (files already present locally are skipped, local extras are kept); after that everything in it can be restored. Restores run between backup passes, one at a time; progress and the result are shown in the section and in the log.
 
 # Settings reference
@@ -87,6 +91,9 @@ max_title_size_mb=4096
 
 # Number of dated snapshots retained, values 0 thru 10 are valid; 0 means disabled (int)
 daily_snapshots_to_keep=2
+
+# Days to keep previous versions of game saves (backup/history), 0 thru 30; 0 means off (int)
+history_days_to_keep=3
 
 # Id of the backup USB partition (content of its PS5SavesBackup.id file); pick it on the settings page
 usb_id=0123456789abcdef0123456789abcdef

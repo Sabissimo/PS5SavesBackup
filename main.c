@@ -122,6 +122,10 @@ along with this program; see the file COPYING. If not, see
 /* The USB root, backup.conf, backup/ and backup_daily/ paths are selected at
  * run time: g_usb_root, g_conf_path, g_backup_root, g_daily_root. */
 #define MAX_DAILY     10      /* highest value for daily_snapshots_to_keep= */
+#define HISTORY_DIR   "history"      /* previous versions of saves, below backup/ */
+#define UNDO_DIR      "restore_undo" /* images replaced by a restore, below backup/ */
+#define DEF_HISTORY_DAYS 3    /* history_days_to_keep= default */
+#define MAX_HISTORY_DAYS 30
 #define MAX_DAILY_DIRS 1024   /* date folders looked at when pruning */
 #define TMP_IMG       TMP_DIR "/_backup_tmp_image"
 #define MOUNT_POINT   PFS_ROOT "/savebackup_tmp"
@@ -274,6 +278,8 @@ static int g_nseen = 0;
 static uint64_t g_max_game = DEF_GAME_MB * BYTES_PER_MB;
 static uint64_t g_file_cap = MAX_FILE_SZ;   /* per-file limit, 0 = none */
 static int g_daily = 0;                     /* daily_snapshots_to_keep=N, 0 = off */
+static int g_history_days = DEF_HISTORY_DAYS; /* history_days_to_keep=N, 0 = off */
+static int g_skip_index = 0;                /* save-image files: no change cache */
 static int g_ps4saves = 0;
 static int g_ps5saves = 0;
 static int g_need_cleanup = 1;
@@ -290,6 +296,7 @@ static char g_abort_why[192];
 
 
 static void logq(const char *fmt, ...);
+static int remove_tree(const char *path);
 static void ui_log_push(const char *msg);
 static void ui_set_state(const char *state, const char *reason);
 static void ui_set_result(const char *fmt, ...);
@@ -728,7 +735,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
   }
 
   /* Exact source and destination metadata cached after a successful copy. */
-  if(file_current(dst, st)) {
+  if(!g_skip_index && file_current(dst, st)) {
     stats->unchanged++;
     if(g_progress_image) progress_advance(st->st_size);
     return;
@@ -824,7 +831,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     goto done;
   }
 
-  index_update(dst, st);
+  if(!g_skip_index) index_update(dst, st);
   ok = 1;
 
 done:
@@ -1164,6 +1171,112 @@ stamp_write(const char *dst_dir, const struct stat *img) {
 }
 
 
+/* History versions are folders named by console local time. */
+static void
+history_version_name(char *out, size_t len) {
+  time_t now = wall_clock();
+  struct tm lt;
+
+  localtime_r(&now, &lt);
+  strftime(out, len, "%Y-%m-%d_%H%M%S", &lt);
+}
+
+
+static time_t
+history_version_time(const char *name) {
+  struct tm tm;
+  int y, mo, d, h, mi, s;
+
+  if(strlen(name) < 17 || sscanf(name, "%4d-%2d-%2d_%2d%2d%2d", &y, &mo, &d, &h, &mi, &s) != 6) return 0;
+  memset(&tm, 0, sizeof tm);
+  tm.tm_year = y - 1900;
+  tm.tm_mon = mo - 1;
+  tm.tm_mday = d;
+  tm.tm_hour = h;
+  tm.tm_min = mi;
+  tm.tm_sec = s;
+  tm.tm_isdst = -1;
+  return mktime(&tm);
+}
+
+
+/**
+ * A save was backed up completely into work_dir (<dst_dir>.part). The
+ * previous version moves to history (or is dropped when history is off) and
+ * the new one becomes the live copy, so the live copy is always complete
+ * and exactly mirrors the save.
+ **/
+static int
+save_commit(const char *dst_dir, const char *work_dir, int ps5, const char *uid,
+            const char *title, const char *save) {
+  char hist[PATH_MAX], version[32];
+  struct stat st;
+
+  if(!stat(dst_dir, &st) && S_ISDIR(st.st_mode)) {
+    if(g_history_days > 0) {
+      history_version_name(version, sizeof version);
+      if(snprintf(hist, sizeof hist, "%s/%s/%s/%s/%s/%s", g_backup_root, HISTORY_DIR,
+                  ps5 ? "ps5" : "ps4", uid, title, save) >= (int)sizeof hist || mkdir_p(hist)) {
+        return -1;
+      }
+      if(snprintf(hist, sizeof hist, "%s/%s/%s/%s/%s/%s/%s", g_backup_root, HISTORY_DIR,
+                  ps5 ? "ps5" : "ps4", uid, title, save, version) >= (int)sizeof hist) {
+        return -1;
+      }
+      if(!stat(hist, &st)) {
+        /* two versions within one second: keep both */
+        size_t len = strlen(hist);
+        snprintf(hist + len, sizeof hist - len, "-%ld", (long)(now_seconds() * 1000) % 1000);
+      }
+      if(rename(dst_dir, hist)) {
+        return -1;
+      }
+      logq("Save version kept: %s", hist + strlen(g_backup_root) + 1);
+    } else if(remove_tree(dst_dir)) {
+      return -1;
+    }
+  }
+  return rename(work_dir, dst_dir);
+}
+
+
+/* Removes history versions older than history_days_to_keep (all of them
+ * when history is off). Empty folders left behind are removed too. */
+static void
+history_prune_dir(const char *dir, int depth, time_t cutoff) {
+  char path[PATH_MAX];
+  struct dirent *dp;
+  struct stat st;
+  DIR *d;
+
+  if(!(d = opendir(dir))) return;
+  while((dp = readdir(d))) {
+    if(dp->d_name[0] == '.') continue;
+    if(snprintf(path, sizeof path, "%s/%s", dir, dp->d_name) >= (int)sizeof path ||
+       lstat(path, &st) || !S_ISDIR(st.st_mode)) continue;
+    if(depth < 4) {
+      history_prune_dir(path, depth + 1, cutoff);
+    } else {
+      time_t t = history_version_time(dp->d_name);
+      if(t && t < cutoff) {
+        if(!remove_tree(path)) logq("Save version removed: %s", path + strlen(g_backup_root) + 1);
+      }
+    }
+  }
+  closedir(d);
+  rmdir(dir);                                 /* only succeeds when empty */
+}
+
+
+static void
+history_prune(void) {
+  char hist[PATH_MAX];
+
+  snprintf(hist, sizeof hist, "%s/%s", g_backup_root, HISTORY_DIR);
+  history_prune_dir(hist, 0, wall_clock() - (time_t)g_history_days * 86400);
+}
+
+
 /**
  * Back up one save image. The original is only read: a copy is mounted.
  **/
@@ -1173,6 +1286,7 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   char image[PATH_MAX];
   char label[PATH_MAX];
   char dst_dir[PATH_MAX];
+  char work_dir[PATH_MAX];
   char why[160];
   uint8_t sealed[0x60];
   uint8_t key[0x20];
@@ -1196,6 +1310,9 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   snprintf(image, sizeof image, "%s/%s", tdir, name);
   save_dst_dir(dst_dir, sizeof dst_dir, ps5, uid, title, save);
   snprintf(label, sizeof label, "%s", dst_dir + strlen(g_backup_root));
+  if(snprintf(work_dir, sizeof work_dir, "%s.part", dst_dir) >= (int)sizeof work_dir) {
+    return SV_SKIP;
+  }
 
   if(stat(image, &ist) || !S_ISREG(ist.st_mode)) {
     return SV_SKIP;
@@ -1322,7 +1439,11 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   progress_stage(dir_size(MOUNT_POINT), 0.5, 0.5);
   failed_before = stats->failed;
   g_file_cap = 0;     /* the whole game was already judged against its limit */
-  backup_tree(MOUNT_POINT, dst_dir, stats);
+  /* a complete fresh copy next to the live one; swapped in on success */
+  remove_tree(work_dir);
+  g_skip_index = 1;
+  backup_tree(MOUNT_POINT, work_dir, stats);
+  g_skip_index = 0;
   g_file_cap = MAX_FILE_SZ;
 
   game_watch();
@@ -1362,10 +1483,19 @@ cleanup:
   g_progress_image = 0;
 
   if(result == SV_OK && usb_online()) {
+    if(save_commit(dst_dir, work_dir, ps5, uid, title, save)) {
+      logq("Failed to backup %s (cannot replace the previous version)", label);
+      remove_tree(work_dir);
+      stats->failed++;
+      return SV_FAILED;
+    }
     stamp_write(dst_dir, &ist);
-  } else if(result == SV_FAILED) {
-    logq("Failed to backup %s", label);
-    stats->failed++;
+  } else {
+    remove_tree(work_dir);
+    if(result == SV_FAILED) {
+      logq("Failed to backup %s", label);
+      stats->failed++;
+    }
   }
   return result;
 
@@ -1729,6 +1859,14 @@ backup_entry(char *line, backup_stats_t *stats) {
     g_daily = (int)v;
     return;
   }
+  if((value = config_value(line, "history_days_to_keep", "history_days_to_keep"))) {
+    long v;
+    if(!config_number(value, 0, MAX_HISTORY_DAYS, &v)) {
+      return;
+    }
+    g_history_days = (int)v;
+    return;
+  }
   if((value = config_value(line, "backup_ps4_saves", "ps4saves"))) {
     parse_bool(value, &g_ps4saves);
     return;
@@ -2011,6 +2149,11 @@ copy_tree(const char *src, const char *dst, uint64_t *bytes) {
        (len > 5 && !strcmp(dp->d_name + len - 5, ".part"))) {
       continue;
     }
+    /* save history and undo copies are not part of a snapshot */
+    if(!strcmp(src, g_backup_root) &&
+       (!strcmp(dp->d_name, HISTORY_DIR) || !strcmp(dp->d_name, UNDO_DIR))) {
+      continue;
+    }
     if(snprintf(spath, sizeof spath, "%s/%s", src, dp->d_name) >= (int)sizeof spath ||
        snprintf(dpath, sizeof dpath, "%s/%s", dst, dp->d_name) >= (int)sizeof dpath ||
        lstat(spath, &st)) {
@@ -2246,6 +2389,7 @@ run_cycle(int pending_only) {
   g_game_abort = 0;
   g_watch_game = 0;
   g_gdrive_enabled = 0;
+  g_history_days = DEF_HISTORY_DAYS;
   snprintf(g_gdrive_folder, sizeof g_gdrive_folder, "%s", GDRIVE_DEFAULT_FOLDER);
 
   g_progress_planning = 1;
@@ -2272,6 +2416,7 @@ run_cycle(int pending_only) {
   g_interval = DEF_INTERVAL;
   g_max_game = DEF_GAME_MB * BYTES_PER_MB;
   g_daily = g_ps4saves = g_ps5saves = g_gdrive_enabled = 0;
+  g_history_days = DEF_HISTORY_DAYS;
   snprintf(g_gdrive_folder, sizeof g_gdrive_folder, "%s", GDRIVE_DEFAULT_FOLDER);
   while(fgets(line, sizeof line, f)) {
     backup_entry(line, &stats);
@@ -2300,7 +2445,10 @@ run_cycle(int pending_only) {
   /* Regular files have already been processed. A deferred save-image pass
    * must not prevent a snapshot of the available live backup. */
   index_save();
-  if(!g_pending_only) daily_check();
+  if(!g_pending_only) {
+    daily_check();
+    history_prune();
+  }
   progress_stop();
 
 

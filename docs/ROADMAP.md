@@ -47,9 +47,11 @@ plain files/folders and PS4/PS5 saves, from the local backup folder, plus
 "Download from Google Drive" to fill the local backup folder on a console
 that has nothing yet.
 
-Status: implemented and host-tested (commit after babd224): `restore.h`,
-Restore section on the page, Drive download, `tests/restore.sh`. Waiting for
-the console checks listed in docs/RESTORE.md.
+Status: implemented and host-tested (commits 3391fee and after): `restore.h`,
+Restore section on the page, Drive download, save history with
+`history_days_to_keep` retention (pruned in Drive too), restore from a
+version or a daily snapshot, `tests/restore.sh`. Waiting for the console
+checks listed in docs/RESTORE.md.
 
 ## Planned
 

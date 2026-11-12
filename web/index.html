@@ -96,6 +96,8 @@
       <input type="number" id="max_mb" name="max_mb" min="64" max="65536" required>
       <label for="daily">Daily snapshots to keep (0–10, 0 = off)</label>
       <input type="number" id="daily" name="daily" min="0" max="10" required>
+      <label for="history_days">Days to keep previous versions of game saves (0–30, 0 = off; versions are uploaded to Google Drive too)</label>
+      <input type="number" id="history_days" name="history_days" min="0" max="30" required>
       <div class="check"><input type="checkbox" id="gdrive" name="gdrive"><label for="gdrive" style="margin:0">Upload the backup to Google Drive (works without a USB too: the backup is then kept on internal storage)</label></div>
       <label for="gdrive_folder">Google Drive folder name</label>
       <input type="text" id="gdrive_folder" name="gdrive_folder" maxlength="200" style="width:100%;max-width:420px;background:#0f1115;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:inherit">
@@ -113,9 +115,9 @@
     <h2>Restore</h2>
     <p class="hint">Copies files from the backup back to the console. A save is rebuilt from its backed-up files; the game must not be running, and a copy of the save as it was is kept in the backup folder under <code>restore_undo/</code>.</p>
     <h3 style="font-size:17px;margin:14px 0 6px">Game saves</h3>
-    <table><thead><tr><th>Game</th><th>Save</th><th>User</th><th>Backed up</th><th>State</th><th></th></tr></thead><tbody id="rsaves"></tbody></table>
+    <table><thead><tr><th>Game</th><th>Save</th><th>User</th><th>Version</th><th>State</th><th></th></tr></thead><tbody id="rsaves"></tbody></table>
     <h3 style="font-size:17px;margin:14px 0 6px">Files and folders</h3>
-    <table><thead><tr><th>Path</th><th>Backed up</th><th>State</th><th></th></tr></thead><tbody id="rfiles"></tbody></table>
+    <table><thead><tr><th>Path</th><th>Version</th><th>State</th><th></th></tr></thead><tbody id="rfiles"></tbody></table>
     <div class="actions"><button id="gdDownload" class="secondary">Download the backup from Google Drive</button></div>
     <div class="msg" id="rMsg"></div>
     <div class="row" style="margin-top:6px"><span class="kv" id="rStatus"></span></div>
@@ -199,15 +201,22 @@
   function config() {
     return get('/api/config').then(function (c) {
       $('interval').value = c.interval; $('ps4').checked = c.ps4; $('ps5').checked = c.ps5;
-      $('max_mb').value = c.max_mb; $('daily').value = c.daily; $('paths').value = c.paths.join('\n');
+      $('max_mb').value = c.max_mb; $('daily').value = c.daily; $('history_days').value = c.history_days; $('paths').value = c.paths.join('\n');
       $('gdrive').checked = c.gdrive; $('gdrive_folder').value = c.gdrive_folder;
     });
   }
   function fmtWhen(t) { return t ? new Date(t * 1000).toLocaleString() : '-'; }
-  function restoreBtn(label, params, prompt) {
+  function versionSelect(versions, when) {
+    var sel = document.createElement('select'); sel.style.cssText = 'background:#0f1115;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit;font-size:15px;max-width:260px';
+    var o = document.createElement('option'); o.value = ''; o.textContent = 'latest backup (' + fmtWhen(when) + ')'; sel.appendChild(o);
+    (versions || []).forEach(function (v) { var x = document.createElement('option'); x.value = v.id; x.textContent = v.label; sel.appendChild(x); });
+    return sel;
+  }
+  function restoreBtn(label, params, prompt, sel) {
     var b = document.createElement('button'); b.textContent = label; b.className = 'secondary'; b.style.padding = '6px 12px';
     b.addEventListener('click', function () {
-      if (!confirm(prompt)) return;
+      if (sel) params.set('source', sel.value);
+      if (!confirm(prompt + (sel && sel.value ? ' Source: ' + sel.options[sel.selectedIndex].textContent + '.' : ''))) return;
       post('/api/restore', params).then(function (j) { note($('rMsg'), j); setTimeout(restoreList, 1000); });
     });
     return b;
@@ -218,9 +227,10 @@
       r.saves.forEach(function (s) {
         var tr = document.createElement('tr');
         var state = s.running ? 'game running' : !s.slot_exists ? 'no save slot on this console' : 'ready';
-        tr.innerHTML = '<td>' + s.ps.toUpperCase() + ' ' + s.title + '</td><td>' + s.save + '</td><td>' + s.uid + '</td><td>' + fmtWhen(s.backed_up) + ' (' + s.files + ' files, ' + fmtBytes(s.bytes) + ')</td><td>' + state + '</td><td></td>';
+        tr.innerHTML = '<td>' + s.ps.toUpperCase() + ' ' + s.title + '</td><td>' + s.save + '</td><td>' + s.uid + '</td><td></td><td>' + state + '</td><td></td>';
+        var sel = versionSelect(s.versions, s.backed_up); tr.children[3].appendChild(sel);
         var p = new URLSearchParams(); p.set('kind', 'save'); p.set('ps', s.ps); p.set('uid', s.uid); p.set('title', s.title); p.set('save', s.save);
-        var b = restoreBtn('Restore', p, 'Replace the current ' + s.ps.toUpperCase() + ' save ' + s.title + '/' + s.save + ' with the backup? The current save is kept as an undo copy.');
+        var b = restoreBtn('Restore', p, 'Replace the current ' + s.ps.toUpperCase() + ' save ' + s.title + '/' + s.save + ' with the backup? The current save is kept as an undo copy.', sel);
         b.disabled = s.running || !s.slot_exists || r.status.busy;
         tr.lastChild.appendChild(b); ts.appendChild(tr);
       });
@@ -229,9 +239,10 @@
       r.files.forEach(function (f) {
         var tr = document.createElement('tr');
         var state = !f.in_backup ? 'not in the backup yet' : f.running ? 'application running' : 'ready';
-        tr.innerHTML = '<td>' + f.path + '</td><td>' + (f.in_backup ? fmtWhen(f.backed_up) + ' (' + f.files + ' files, ' + fmtBytes(f.bytes) + ')' : '-') + '</td><td>' + state + '</td><td></td>';
+        tr.innerHTML = '<td>' + f.path + '</td><td></td><td>' + state + '</td><td></td>';
+        var sel = versionSelect(f.versions, f.backed_up); tr.children[1].appendChild(sel);
         var p = new URLSearchParams(); p.set('kind', 'path'); p.set('path', f.path);
-        var b = restoreBtn('Restore', p, 'Copy ' + f.path + ' back from the backup? Existing files are overwritten.');
+        var b = restoreBtn('Restore', p, 'Copy ' + f.path + ' back from the backup? Existing files are overwritten.', sel);
         b.disabled = !f.in_backup || f.running || r.status.busy;
         tr.lastChild.appendChild(b); tf.appendChild(tr);
       });
@@ -254,7 +265,7 @@
   $('form').addEventListener('submit', function (e) {
     e.preventDefault();
     var p = new URLSearchParams();
-    p.set('interval', $('interval').value); p.set('max_mb', $('max_mb').value); p.set('daily', $('daily').value);
+    p.set('interval', $('interval').value); p.set('max_mb', $('max_mb').value); p.set('daily', $('daily').value); p.set('history_days', $('history_days').value);
     if ($('ps4').checked) p.set('ps4', 'on'); if ($('ps5').checked) p.set('ps5', 'on');
     if ($('gdrive').checked) p.set('gdrive', 'on'); p.set('gdrive_folder', $('gdrive_folder').value);
     p.set('paths', $('paths').value);

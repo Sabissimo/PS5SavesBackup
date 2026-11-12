@@ -137,6 +137,32 @@ class H(BaseHTTPRequestHandler):
             f["modified"] = "2026-11-12T10:%02d:%02d.000Z" % (counters["uploads"] // 60 % 60, counters["uploads"] % 60)
         return self.send_json(200, {"id": m.group(1)})
 
+    def do_DELETE(self):
+        u = urlparse(self.path)
+        m = re.match(r"^/drive/v3/files/([^/]+)$", u.path)
+        if not m:
+            return self.send_json(404, {"error": "no such endpoint"})
+        if not self.authed():
+            return
+        with lock:
+            counters["api_calls"] += 1
+            if m.group(1) not in store:
+                return self.send_json(404, {"error": {"code": 404, "message": "File not found"}})
+            doomed = {m.group(1)}
+            changed = True
+            while changed:
+                changed = False
+                for i, f in store.items():
+                    if f["parent"] in doomed and i not in doomed:
+                        doomed.add(i)
+                        changed = True
+            for i in doomed:
+                store.pop(i, None)
+            counters["deletes"] = counters.get("deletes", 0) + 1
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/drive/v3/files":

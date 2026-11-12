@@ -1003,6 +1003,86 @@ gd_sync_file(const char *root_id, const char *root, const char *path, const char
 }
 
 
+/* Deletes a Drive file or folder (with its content). 0 also when gone. */
+static int
+gd_delete(const char *id, char *err, size_t elen) {
+  char url[512];
+  http_response_t resp;
+
+  snprintf(url, sizeof url, "%s/drive/v3/files/%s", gd_api_base(), id);
+  if(gd_api("DELETE", url, NULL, NULL, 0, &resp, err, elen)) return -1;
+  if(resp.status != 204 && resp.status != 200 && resp.status != 404) {
+    snprintf(err, elen, "Google Drive delete failed (HTTP %d)", resp.status);
+    http_response_free(&resp);
+    return -1;
+  }
+  http_response_free(&resp);
+  return 0;
+}
+
+
+/* Drops every index entry at rel or below it. */
+static void
+gd_index_drop_prefix(const char *rel) {
+  size_t len = strlen(rel);
+
+  for(unsigned i = 0; i < GDRIVE_INDEX_BUCKETS; i++) {
+    gd_entry_t **link = &gd_index[i];
+    while(*link) {
+      gd_entry_t *e = *link;
+      if(!strncmp(e->path, rel, len) && (e->path[len] == 0 || e->path[len] == '/')) {
+        *link = e->next;
+        free(e->path);
+        free(e);
+        gd_index_count--;
+        gd_index_dirty = 1;
+      } else {
+        link = &e->next;
+      }
+    }
+  }
+}
+
+
+/* History versions pruned locally are deleted in Drive as well: these are
+ * the only local deletions mirrored, so the Drive history stays within
+ * history_days_to_keep too. */
+static void
+gd_prune_history(const char *root, gd_sync_stats_t *stats) {
+  char (*gone)[PATH_MAX] = NULL;
+  int n = 0;
+  size_t hlen = strlen(HISTORY_DIR);
+
+  if(!(gone = malloc(64 * sizeof *gone))) return;
+  for(unsigned i = 0; i < GDRIVE_INDEX_BUCKETS && n < 64; i++) {
+    for(gd_entry_t *e = gd_index[i]; e && n < 64; e = e->next) {
+      char local[PATH_MAX];
+      struct stat st;
+      int slashes = 0;
+      if(!e->dir || strncmp(e->path, HISTORY_DIR, hlen) || e->path[hlen] != '/') continue;
+      for(const char *p = e->path; *p; p++) slashes += *p == '/';
+      if(slashes != 5) continue;                 /* history/ps/uid/title/save/version */
+      if(snprintf(local, sizeof local, "%s/%s", root, e->path) >= (int)sizeof local) continue;
+      if(!stat(local, &st)) continue;
+      snprintf(gone[n++], PATH_MAX, "%s", e->path);
+    }
+  }
+  for(int i = 0; i < n; i++) {
+    gd_entry_t *e = gd_index_get(gone[i], 0);
+    char err[256];
+    if(!e) continue;
+    if(gd_delete(e->id, err, sizeof err)) {
+      snprintf(stats->err, sizeof stats->err, "%s", err);
+      stats->failed++;
+      break;
+    }
+    logq("Google Drive: removed old save version %s", gone[i]);
+    gd_index_drop_prefix(gone[i]);
+  }
+  free(gone);
+}
+
+
 static int
 gd_sync_tree(const char *root_id, const char *root, const char *dir, gd_sync_stats_t *stats, int plan) {
   char path[PATH_MAX];
@@ -1014,6 +1094,7 @@ gd_sync_tree(const char *root_id, const char *root, const char *dir, gd_sync_sta
   if(!(d = opendir(dir))) return 0;
   while((dp = readdir(d)) && !rc) {
     if(!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..") || gd_skip_name(dp->d_name)) continue;
+    if(!strcmp(dir, root) && !strcmp(dp->d_name, UNDO_DIR)) continue;   /* undo images stay local */
     if(snprintf(path, sizeof path, "%s/%s", dir, dp->d_name) >= (int)sizeof path || lstat(path, &st)) continue;
     if(S_ISDIR(st.st_mode)) {
       rc = gd_sync_tree(root_id, root, path, stats, plan);
@@ -1051,8 +1132,10 @@ gd_sync(const char *root, const char *folder_name) {
     return -1;
   }
   gd_index_load(root_id);
+  gd_prune_history(root, &stats);
   gd_sync_tree(root_id, root, root, &stats, 1);      /* count first, without network */
   if(!stats.planned) {
+    gd_index_save(root_id);
     gd_index_clear();
     pthread_mutex_lock(&gd_mutex);
     gd_state.last_sync = wall_clock();

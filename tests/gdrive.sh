@@ -175,6 +175,36 @@ stop
 mkdir -p "$T/mnt/usb2"; echo 0123456789abcdef0123456789abcdef > "$T/mnt/usb2/PS5SavesBackup.id"
 settings 0123456789abcdef0123456789abcdef true "My PS5 saves"
 
+echo "== Scenario: save history uploaded to Drive and pruned there"
+HOME_ROOT=$T/home; UID1=1a2b3c4d; TITLE=PPSA12345
+mkdir -p "$HOME_ROOT/$UID1/savedata_prospero/$TITLE" "$T/fixture"
+echo "level 1" > "$T/fixture/progress.dat"; tar -cf "$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1" -C "$T/fixture" .
+printf 'backup_interval_seconds=1\nusb_id=0123456789abcdef0123456789abcdef\ngdrive_enabled=true\ngdrive_folder=My PS5 saves\nbackup_ps5_saves=true\nhistory_days_to_keep=3\n%s/src/\n' "$T" > "$DATA/backup.conf"
+start
+wait_log "Backup complete"
+wait_log "file(s) uploaded"
+check "save uploaded to Drive" "[ -n \"\$(file_id progress.dat)\" ]"
+sleep 1.1; echo "level 2" > "$T/fixture/progress.dat"; tar -cf "$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1" -C "$T/fixture" .
+wait_log "Save version kept"
+for i in $(seq 1 100); do [ -n "$(file_id history)" ] && sleep 1 && break; sleep 0.1; done
+hist=$(file_id history)
+check "history folder in Drive" "[ -n '$hist' ]"
+nver=$(dump | python3 -I -c "import json,sys; d=json.load(sys.stdin)['files']; print(sum(1 for f in d.values() if f['parent']==sys.argv[1]))" "$(file_id slot1)")
+check "one version folder uploaded" "[ \$(dump | python3 -I -c \"import json,sys; d=json.load(sys.stdin)['files']; print(sum(1 for f in d.values() if f['name'].startswith('20') and f['mime'].endswith('folder')))\") -ge 1 ]"
+check "undo copies never uploaded" "[ -z \"\$(file_id restore_undo)\" ]"
+stop
+echo $(( $(date +%s) + 10 * 86400 )) > "$T/now.txt"
+TEST_NOW_FILE=$T/now.txt TEST_GDRIVE_OAUTH_BASE=$G TEST_GDRIVE_API_BASE=$G "$BIN" >"$LOG" 2>/dev/null &
+PID=$!
+for i in $(seq 1 50); do curl -s "$URL/api/status" >/dev/null 2>&1 && break; sleep 0.1; done
+wait_log "Save version removed"
+wait_log "Google Drive: removed old save version"
+sleep 1
+check "version folder deleted in Drive" "[ \$(dump | python3 -I -c \"import json,sys; d=json.load(sys.stdin)['files']; print(sum(1 for f in d.values() if f['name'].startswith('20') and f['mime'].endswith('folder')))\") = 0 ] && [ \$(dump | python3 -I -c \"import json,sys; print(json.load(sys.stdin)['counters'].get('deletes',0))\") -ge 1 ]"
+stop
+rm -f "$T/now.txt"
+printf 'backup_interval_seconds=1\nusb_id=0123456789abcdef0123456789abcdef\ngdrive_enabled=true\ngdrive_folder=My PS5 saves\n%s/src/\n' "$T" > "$DATA/backup.conf"
+
 echo "== Scenario: revoked token"
 touch "$T/gstate/revoked"
 python3 -I - "$DATA/gdrive.token" <<'EOF'

@@ -307,8 +307,9 @@ usb_mark(const char *root, char *id_out) {
 /* Restore jobs and listings (restore.h, included after this file). */
 typedef enum { JOB_NONE, JOB_RESTORE_PATH, JOB_RESTORE_SAVE, JOB_GDRIVE_DOWNLOAD } job_kind_t;
 static int job_submit(job_kind_t kind, const char *path, int ps5, const char *uid,
-                      const char *title, const char *save);
+                      const char *title, const char *save, const char *source);
 static void job_status_json(jw_t *w);
+static int restore_source_valid(const char *source);
 static void list_saves_json(jw_t *w);
 static void list_paths_json(jw_t *w);
 
@@ -550,6 +551,7 @@ api_config_get(int c) {
   jw_field_bool(&w, "ps5", s->ps5, 1);
   jw_field_num(&w, "max_mb", s->max_mb, 1);
   jw_field_num(&w, "daily", s->daily, 1);
+  jw_field_num(&w, "history_days", s->history_days, 1);
   jw_field_str(&w, "usb_id", s->usb_id, 1);
   jw_field_bool(&w, "gdrive", s->gdrive, 1);
   jw_field_str(&w, "gdrive_folder", s->gdrive_folder, 1);
@@ -789,16 +791,21 @@ api_restore_list(int c) {
 
 static void
 api_restore(int c, const char *body) {
-  char kind[16], path[PATH_MAX], ps[8], uid[64], title[16], save[256];
+  char kind[16], path[PATH_MAX], ps[8], uid[64], title[16], save[256], source[160];
   int rc;
 
   form_get(body, "kind", kind, sizeof kind);
+  form_get(body, "source", source, sizeof source);
+  if(!restore_source_valid(source)) {
+    web_message(c, "400 Bad Request", "error", "invalid source");
+    return;
+  }
   if(!strcmp(kind, "path")) {
     if(!form_get(body, "path", path, sizeof path) || path[0] != '/') {
       web_message(c, "400 Bad Request", "error", "path is missing");
       return;
     }
-    rc = job_submit(JOB_RESTORE_PATH, path, 0, NULL, NULL, NULL);
+    rc = job_submit(JOB_RESTORE_PATH, path, 0, NULL, NULL, NULL, source);
   } else if(!strcmp(kind, "save")) {
     form_get(body, "ps", ps, sizeof ps);
     form_get(body, "uid", uid, sizeof uid);
@@ -809,7 +816,7 @@ api_restore(int c, const char *body) {
       web_message(c, "400 Bad Request", "error", "invalid save reference");
       return;
     }
-    rc = job_submit(JOB_RESTORE_SAVE, NULL, !strcmp(ps, "ps5"), uid, title, save);
+    rc = job_submit(JOB_RESTORE_SAVE, NULL, !strcmp(ps, "ps5"), uid, title, save, source);
   } else {
     web_message(c, "400 Bad Request", "error", "kind must be path or save");
     return;
@@ -889,7 +896,7 @@ web_handle(int c) {
   } else if(!strcmp(method, "POST") && !strcmp(path, "/api/gdrive/download")) {
     if(!gd_connected()) {
       web_message(c, "400 Bad Request", "error", "Google Drive is not signed in");
-    } else if(job_submit(JOB_GDRIVE_DOWNLOAD, NULL, 0, NULL, NULL, NULL)) {
+    } else if(job_submit(JOB_GDRIVE_DOWNLOAD, NULL, 0, NULL, NULL, NULL, "")) {
       web_message(c, "409 Conflict", "error", "another restore is still running");
     } else {
       web_message(c, "202 Accepted", "ok", "Download queued");

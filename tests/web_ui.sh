@@ -57,7 +57,7 @@ check "405-ish: POST to status rejected" "has \"\$(curl -s -X POST $URL/api/stat
 
 echo "== Scenario: saving settings migrates to the internal file and marks the USB"
 r=$(curl -s -X POST "$URL/api/config" --data-urlencode "interval=2" --data-urlencode "max_mb=1024" \
-    --data-urlencode "daily=1" --data "ps5=on" --data-urlencode "paths=$T/src/
+    --data-urlencode "daily=1" --data-urlencode "history_days=3" --data "ps5=on" --data-urlencode "paths=$T/src/
 # comment
 $T/src/a.txt")
 check "save accepted" "has \"\$r\" 'Settings saved'"
@@ -75,9 +75,9 @@ check "daily snapshot made on usb2" "[ -d '$T/mnt/usb2/backup_daily' ]"
 check "usb0 untouched" "[ -z \"\$(tree '$T/mnt/usb0')\" ]"
 
 echo "== Scenario: validation"
-check "interval out of range" "has \"\$(curl -s -X POST $URL/api/config --data 'interval=99999&max_mb=1024&daily=1&paths=/x')\" 'interval must be between'"
-check "daily out of range" "has \"\$(curl -s -X POST $URL/api/config --data 'interval=5&max_mb=1024&daily=99&paths=/x')\" 'daily must be between'"
-check "relative path refused" "has \"\$(curl -s -X POST $URL/api/config --data 'interval=5&max_mb=1024&daily=1&paths=relative')\" 'paths must be absolute'"
+check "interval out of range" "has \"\$(curl -s -X POST $URL/api/config --data 'interval=99999&max_mb=1024&daily=1&history_days=3&paths=/x')\" 'interval must be between'"
+check "daily out of range" "has \"\$(curl -s -X POST $URL/api/config --data 'interval=5&max_mb=1024&daily=99&history_days=3&paths=/x')\" 'daily must be between'"
+check "relative path refused" "has \"\$(curl -s -X POST $URL/api/config --data 'interval=5&max_mb=1024&daily=1&history_days=3&paths=relative')\" 'paths must be absolute'"
 check "missing field" "has \"\$(curl -s -X POST $URL/api/config --data 'interval=5')\" 'max_mb is missing'"
 check "settings unchanged after errors" "grep -q '^backup_interval_seconds=2$' '$DATA/backup.conf'"
 check "unknown USB refused" "has \"\$(curl -s -X POST $URL/api/usb/select --data-urlencode root=$T/mnt/usb7)\" 'not a mounted USB partition'"

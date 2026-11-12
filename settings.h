@@ -19,6 +19,7 @@ typedef struct settings {
   int  ps5;
   long max_mb;
   int  daily;
+  int  history_days;
   char usb_id[USB_ID_LEN + 1];
   int  gdrive;
   char gdrive_folder[256];
@@ -34,6 +35,7 @@ settings_defaults(settings_t *s) {
   s->ps5 = 0;
   s->max_mb = DEF_GAME_MB;
   s->daily = 0;
+  s->history_days = DEF_HISTORY_DAYS;
   s->usb_id[0] = 0;
   s->gdrive = 0;
   snprintf(s->gdrive_folder, sizeof s->gdrive_folder, "%s", GDRIVE_DEFAULT_FOLDER);
@@ -99,6 +101,8 @@ settings_line(settings_t *s, char *line) {
     if(config_number(value, MIN_GAME_MB, MAX_GAME_MB, &v)) s->max_mb = v;
   } else if((value = config_value(line, "daily_snapshots_to_keep", "dailybackups"))) {
     if(config_number(value, 0, MAX_DAILY, &v)) s->daily = (int)v;
+  } else if((value = config_value(line, "history_days_to_keep", "history_days_to_keep"))) {
+    if(config_number(value, 0, MAX_HISTORY_DAYS, &v)) s->history_days = (int)v;
   } else if((value = config_value(line, "backup_ps4_saves", "ps4saves"))) {
     parse_bool(value, &s->ps4);
   } else if((value = config_value(line, "backup_ps5_saves", "ps5saves"))) {
@@ -173,6 +177,9 @@ settings_save(const char *path, const settings_t *s) {
     "# Number of dated snapshots retained, values 0 thru %d are valid; 0 means disabled (int)\n"
     "daily_snapshots_to_keep=%d\n"
     "\n"
+    "# Days to keep previous versions of game saves (backup/history), 0 thru %d; 0 means off (int)\n"
+    "history_days_to_keep=%d\n"
+    "\n"
     "# Id of the backup USB partition (content of its %s file); pick it on the settings page\n"
     "usb_id=%s\n"
     "\n"
@@ -185,7 +192,7 @@ settings_save(const char *path, const settings_t *s) {
     "# Files and folders to back up, one absolute path per line\n",
     MIN_INTERVAL, MAX_INTERVAL, s->interval,
     s->ps4 ? "true" : "false", s->ps5 ? "true" : "false",
-    s->max_mb, MAX_DAILY, s->daily, MARKER_NAME, s->usb_id,
+    s->max_mb, MAX_DAILY, s->daily, MAX_HISTORY_DAYS, s->history_days, MARKER_NAME, s->usb_id,
     s->gdrive ? "true" : "false", s->gdrive_folder) > 0;
   for(int i = 0; i < s->npaths && ok; i++) {
     ok = fprintf(f, "%s\n", s->paths[i]) > 0;
@@ -310,6 +317,8 @@ settings_from_form(const char *body, settings_t *s, char *err, size_t len) {
   s->max_mb = v;
   if(!form_number(body, "daily", 0, MAX_DAILY, &v, err, len)) return 0;
   s->daily = (int)v;
+  if(!form_number(body, "history_days", 0, MAX_HISTORY_DAYS, &v, err, len)) return 0;
+  s->history_days = (int)v;
   s->ps4 = form_flag(body, "ps4");
   s->ps5 = form_flag(body, "ps5");
   s->gdrive = form_flag(body, "gdrive");

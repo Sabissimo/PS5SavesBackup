@@ -85,7 +85,7 @@ st=$(restore_wait)
 check "overlapping path refused" "has \"\$st\" '\"last_ok\":false' && has \"\$st\" 'contains the backup destination'"
 r=$(curl -s -X POST "$URL/api/restore" --data-urlencode "kind=path" --data-urlencode "path=$T/nowhere")
 st=$(restore_wait)
-check "unknown path refused" "has \"\$st\" 'is not in the backup'"
+check "unknown path refused" "has \"\$st\" 'is not in the latest backup'"
 check "bad request without path" "has \"\$(curl -s -X POST $URL/api/restore --data kind=path)\" 'path is missing'"
 stop
 
@@ -145,7 +145,7 @@ check "mount point cleaned" "[ ! -e '$T/pfs/savebackup_tmp' ] || [ -z \"\$(ls -A
 # refusals
 r=$(curl -s -X POST "$URL/api/restore" --data-urlencode "kind=save" --data-urlencode "ps=ps5" --data-urlencode "uid=$UID1" --data-urlencode "title=$TITLE" --data-urlencode "save=slot9")
 st=$(restore_wait)
-check "unknown save refused" "has \"\$st\" 'not in the backup'"
+check "unknown save refused" "has \"\$st\" 'not in the latest backup'"
 mkdir -p "$T/mnt/usb2/backup/saves/ps5/$UID1/$TITLE/slot2"; echo z > "$T/mnt/usb2/backup/saves/ps5/$UID1/$TITLE/slot2/f"
 r=$(curl -s -X POST "$URL/api/restore" --data-urlencode "kind=save" --data-urlencode "ps=ps5" --data-urlencode "uid=$UID1" --data-urlencode "title=$TITLE" --data-urlencode "save=slot2")
 st=$(restore_wait)
@@ -200,6 +200,76 @@ printf 'backup_interval_seconds=1\nusb_id=0123456789abcdef0123456789abcdef\nback
 wait_log "Backup complete (" 300
 sleep 2
 check "restored save backed up again" "[ -f '$T/mnt/usb2/backup/saves/ps4/$UID1/CUSA54321/SAVEDATA01/.image_stamp' ]"
+stop
+
+# --------------------------------------------------------------------------
+echo "== Scenario: save history: versions, restore from a version and a daily snapshot, pruning"
+rm -rf "${T:?}"; mkdir -p "$T/mnt/usb2" "$HOME_ROOT/$UID1/savedata_prospero/$TITLE" "$T/fixture" "$T/src" "$DATA"
+echo 0123456789abcdef0123456789abcdef > "$T/mnt/usb2/PS5SavesBackup.id"
+echo "level 1" > "$T/fixture/progress.dat"; echo x > "$T/src/a.txt"
+make_image "$T/fixture" "$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1"
+printf 'backup_interval_seconds=1\nusb_id=0123456789abcdef0123456789abcdef\nbackup_ps5_saves=true\ndaily_snapshots_to_keep=2\nhistory_days_to_keep=3\n%s/src/\n' "$T" > "$DATA/backup.conf"
+start
+wait_log "Daily snapshot saved"
+wait_log "Backup complete"
+LIVE=$T/mnt/usb2/backup/saves/ps5/$UID1/$TITLE/slot1
+HIST=$T/mnt/usb2/backup/history/ps5/$UID1/$TITLE/slot1
+today=$(ls "$T/mnt/usb2/backup_daily" | head -1)
+check "daily snapshot holds the save, not the history" "[ -f '$T/mnt/usb2/backup_daily/$today/saves/ps5/$UID1/$TITLE/slot1/progress.dat' ] && [ ! -e '$T/mnt/usb2/backup_daily/$today/history' ]"
+check "no history after the first backup" "[ ! -e '$HIST' ]"
+sleep 1.1; echo "level 2" > "$T/fixture/progress.dat"; make_image "$T/fixture" "$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1"
+for i in $(seq 1 100); do [ "$(count_log 'Backup complete')" -ge 2 ] && break; sleep 0.1; done
+sleep 1.1; echo "level 3" > "$T/fixture/progress.dat"; make_image "$T/fixture" "$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1"
+for i in $(seq 1 100); do [ "$(count_log 'Backup complete')" -ge 3 ] && break; sleep 0.1; done
+sleep 0.5
+check "live copy is the newest save" "[ \"\$(cat '$LIVE/progress.dat')\" = 'level 3' ]"
+check "two versions in history" "[ \$(ls '$HIST' | wc -l) = 2 ]"
+v1=$(ls "$HIST" | sort | head -1); v2=$(ls "$HIST" | sort | tail -1)
+check "oldest version is level 1, newer is level 2" "[ \"\$(cat '$HIST/$v1/progress.dat')\" = 'level 1' ] && [ \"\$(cat '$HIST/$v2/progress.dat')\" = 'level 2' ]"
+assert_log "Save version kept: history/ps5/$UID1/$TITLE/slot1/$v1"
+check "no .part folder left" "[ ! -e '$LIVE.part' ]"
+r=$(curl -s "$URL/api/restore/list")
+check "list offers both versions and the daily snapshot" "has \"\$r\" '\"id\":\"history/$v2\"' && has \"\$r\" '\"id\":\"history/$v1\"' && has \"\$r\" '\"id\":\"daily/$today\",\"label\":\"daily snapshot $today\"'"
+check "invalid source rejected" "has \"\$(curl -s -X POST $URL/api/restore --data 'kind=save&ps=ps5&uid=$UID1&title=$TITLE&save=slot1&source=history/../x')\" 'invalid source'"
+r=$(curl -s -X POST "$URL/api/restore" --data-urlencode "kind=save" --data-urlencode "ps=ps5" --data-urlencode "uid=$UID1" --data-urlencode "title=$TITLE" --data-urlencode "save=slot1" --data-urlencode "source=history/$v1")
+st=$(restore_wait)
+check "restore from the oldest version ok" "has \"\$st\" '\"last_ok\":true' && has \"\$st\" 'restored from history/$v1'"
+check "image is level 1 again" "[ \"\$(image_file '$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1' progress.dat)\" = 'level 1' ]"
+for i in $(seq 1 100); do [ "$(count_log 'Backup complete')" -ge 4 ] && break; sleep 0.1; done
+sleep 0.5
+check "restored image backed up as the new live copy, level 3 went to history" "[ \"\$(cat '$LIVE/progress.dat')\" = 'level 1' ] && [ \$(ls '$HIST' | wc -l) = 3 ]"
+sleep 1.1; echo "level 4" > "$T/fixture/progress.dat"; make_image "$T/fixture" "$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1"
+for i in $(seq 1 100); do [ "$(count_log 'Backup complete')" -ge 5 ] && break; sleep 0.1; done
+r=$(curl -s -X POST "$URL/api/restore" --data-urlencode "kind=save" --data-urlencode "ps=ps5" --data-urlencode "uid=$UID1" --data-urlencode "title=$TITLE" --data-urlencode "save=slot1" --data-urlencode "source=daily/$today")
+st=$(restore_wait)
+check "restore from the daily snapshot ok" "has \"\$st\" '\"last_ok\":true' && has \"\$st\" 'restored from daily/$today'"
+check "image is the snapshot content" "[ \"\$(image_file '$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1' progress.dat)\" = 'level 1' ]"
+for i in $(seq 1 100); do [ "$(count_log 'Backup complete')" -ge 6 ] && break; sleep 0.1; done   # restored save backed up again
+r=$(curl -s -X POST "$URL/api/restore" --data-urlencode "kind=path" --data-urlencode "path=$T/src/a.txt" --data-urlencode "source=history/$v1")
+st=$(restore_wait)
+check "files cannot be restored from a save version" "has \"\$st\" 'no version history'"
+r=$(curl -s -X POST "$URL/api/restore" --data-urlencode "kind=path" --data-urlencode "path=$T/src/a.txt" --data-urlencode "source=daily/$today")
+st=$(restore_wait)
+check "file restored from the daily snapshot" "has \"\$st\" '\"last_ok\":true' && has \"\$st\" 'restored to $T/src/a.txt'"
+# pruning: jump the clock 10 days ahead
+echo $(( $(date +%s) + 10 * 86400 )) > "$T/now.txt"
+stop
+TEST_NOW_FILE=$T/now.txt "$BIN" >"$LOG" 2>/dev/null &
+PID=$!
+for i in $(seq 1 50); do curl -s "$URL/api/status" >/dev/null 2>&1 && break; sleep 0.1; done
+wait_log "Save version removed"
+sleep 1
+check "old versions pruned, history folder gone" "[ ! -e '$HIST' ] && [ ! -e '$T/mnt/usb2/backup/history' ]"
+check "live copy untouched by pruning" "[ -f '$LIVE/progress.dat' ]"
+stop
+# history off: a changed save replaces the live copy without keeping a version
+printf 'backup_interval_seconds=1\nusb_id=0123456789abcdef0123456789abcdef\nbackup_ps5_saves=true\nhistory_days_to_keep=0\n%s/src/\n' "$T" > "$DATA/backup.conf"
+start
+wait_log "Backup"
+sleep 1.1; echo "level 5" > "$T/fixture/progress.dat"; make_image "$T/fixture" "$HOME_ROOT/$UID1/savedata_prospero/$TITLE/slot1"
+for i in $(seq 1 100); do [ "$(cat "$LIVE/progress.dat" 2>/dev/null)" = "level 5" ] && break; sleep 0.1; done
+check "history off: live copy replaced" "[ \"\$(cat '$LIVE/progress.dat')\" = 'level 5' ]"
+check "history off: no version kept" "[ ! -e '$T/mnt/usb2/backup/history' ]"
 stop
 
 echo

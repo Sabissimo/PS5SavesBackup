@@ -72,6 +72,21 @@ same privilege elevation as the backup.
 Rejected alternative: mounting the original image read-write and editing in
 place. Simpler, but an interrupted restore leaves a half-edited save.
 
+## Versions (history)
+`backup_save_image` copies a changed save into `<live>.part` first; on
+success the previous live folder is renamed to
+`backup/history/<ps>/<uid>/<title>/<save>/<YYYY-MM-DD_HHMMSS>` (console local
+time) and the fresh copy becomes the live one, so the live copy always
+mirrors the save exactly (files deleted in the save disappear from the
+backup). `history_days_to_keep` (default 3, max 30, 0 = off) prunes versions
+after every pass; `gd_sync` deletes pruned version folders in Drive through
+the index (the only local deletion mirrored to Drive). Daily snapshots skip
+`history/` and `restore_undo/`; Drive skips `restore_undo/`.
+
+Restore sources: `""` (live), `history/<version>` (saves only),
+`daily/<YYYY-MM-DD>` (saves and files). The `source` form field of
+`POST /api/restore`; the list carries `versions` per entry.
+
 ## Download from Google Drive
 Reverse mirror of the upload: the Drive folder tree is listed
 (`files.list` with `'<id>' in parents`, paged), and every file whose id,
@@ -115,6 +130,7 @@ copies the mount point back. `decrypt_key` is a no-op on the host.
 - [x] gdrive.h: download (reverse mirror), fake server endpoints
 - [x] tests/restore.sh, tests/gdrive.sh download scenario
 - [x] README section "Restoring"
+- [x] save history with retention, Drive pruning, restore from version/snapshot
 - [ ] console check: PS5 save restore on a throw-away game
 - [ ] console check: PS4 save restore
 - [ ] console check: download from Drive on a console without a backup
