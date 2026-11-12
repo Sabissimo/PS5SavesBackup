@@ -97,6 +97,10 @@ usb_id=0123456789abcdef0123456789abcdef
 
 Paths that contain the backup destination (`/`, `/mnt`, the USB itself, `..` tricks) are refused. Plain files larger than 100MB are skipped; a title's saves are backed up completely or not at all, within `max_title_size_mb`.
 
+# Privacy
+
+See [PRIVACY.md](PRIVACY.md): the software stores data only on your console, on the USB you select and, if you enable it, in your own Google Drive. Nothing is sent anywhere else.
+
 # Network
 
 The settings page listens on port 9056 on the console's LAN address. Like the other PS5 homebrew services (FTP, payload loaders) it has no password: anyone on your home network can open it. The payload makes no connections to the internet.
