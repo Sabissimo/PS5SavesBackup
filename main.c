@@ -15,15 +15,19 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 /**
- * Save backup daemon for PS5.
+ * PS5SavesBackup: save backup daemon for PS5 with a settings page.
  *
- * At startup the /mnt/usb<N> mount points are scanned in numerical order and
- * the first one whose root holds a readable backup.conf is selected (see
- * usb_storage.h). That USB is used for everything below; <usb> stands for it
- * (for example /mnt/usb2). There is no fallback to /mnt/usb0: without a
- * backup.conf the payload reports an error and exits.
+ * Settings live in /data/homebrew/PS5SavesBackup/backup.conf and are edited
+ * on the settings page the payload serves (web_ui.h, http://<console>:9056/)
+ * or by hand. The backup USB partition is chosen on that page: it gets a
+ * marker file (PS5SavesBackup.id) and is found again at every start whatever
+ * /mnt/usb<N> number it is mounted at (usb_storage.h). Without a settings
+ * file the PS5Save v2 behaviour applies: the first USB whose root holds a
+ * backup.conf is used, and saving the settings on the page migrates it.
+ * Nothing is ever written to a partition that was not selected, and there is
+ * no fallback to /mnt/usb0. <usb> below stands for the selected partition.
  *
- * Reads <usb>/backup.conf and copies the listed files to
+ * Reads backup.conf and copies the listed files to
  * <usb>/backup/<original path>:
  *
  *   /data/PCSX2/Mcd001.ps2        one file
@@ -162,11 +166,12 @@ int sceNotificationSend(int user_id, bool is_logged, const char *payload);
 #define NOTIFICATION_JSON_SIZE 16384
 
 #ifndef NOTIFICATION_ICON_DIR
-#define NOTIFICATION_ICON_DIR "/user/data/ps5save"
+#define NOTIFICATION_ICON_DIR "/user/data/ps5savesbackup"
 #endif
 #define NOTIFICATION_ICON_PATH NOTIFICATION_ICON_DIR "/notification.png"
 
-static const char PS5SAVE_VERSION[] = "v2";
+#define APP_NAME    "PS5SavesBackup"
+#define APP_VERSION "v3.0"
 
 static int mkdir_p(const char *path);
 
@@ -276,12 +281,17 @@ static int g_mount_stuck = 0;
 static int g_watch_game = 0;      /* protect the currently mounted title */
 static int g_game_abort = 0;      /* abort this save image only */
 static int g_backup_busy = 0;     /* one activity warning per copying pass */
-static int g_start_notified = 0;  /* one startup notification per process */
+static int g_legacy = 0;          /* settings come from backup.conf on the USB */
+static int g_wake_pipe[2] = {-1, -1}; /* settings page -> main loop */
 static double g_last_watch = 0;
 static char g_abort_why[192];
 
 
 static void logq(const char *fmt, ...);
+static void ui_log_push(const char *msg);
+static void ui_set_state(const char *state, const char *reason);
+static void ui_set_result(const char *fmt, ...);
+static void ui_set_due(double due);
 
 /* Escape every JSON control character and reject overflow rather than emit
  * truncated or malformed JSON. UTF-8 bytes are preserved. */
@@ -317,7 +327,7 @@ notification_json_escape(char *dst, size_t size, const char *src) {
   return 1;
 }
 
-/* Standard informative notification: status message, PS5Save label and image.
+/* Standard informative notification: status message, app label and image.
  * Use a plain local image path, as in the SMP rich notification transport.
  * No interactive actions, alternate views or legacy debug popups. */
 static int
@@ -335,16 +345,16 @@ build_notification_payload(const char *message, const char *created_at,
     "{\"rawData\":{"
       "\"viewTemplateType\":\"ToastTemplateB\","
       "\"channelType\":\"SystemFeedback\","
-      "\"bundleName\":\"PS5Save\",\"useCaseId\":\"IDC\","
+      "\"bundleName\":\"" APP_NAME "\",\"useCaseId\":\"IDC\","
       "\"soundEffect\":\"none\",\"toastOverwriteType\":\"No\","
       "\"isImmediate\":true,\"priority\":100,"
       "\"viewData\":{"
         "\"icon\":{\"type\":\"Url\",\"parameters\":{"
           "\"url\":\"" NOTIFICATION_ICON_PATH "\"}},"
         "\"message\":{\"body\":\"%s\"},"
-        "\"subMessage\":{\"body\":\"PS5Save | Version %s\"}}},"
+        "\"subMessage\":{\"body\":\"" APP_NAME " | Version %s\"}}},"
       "\"createdDateTime\":\"%s\",\"localNotificationId\":\"%s\"}",
-    escaped, PS5SAVE_VERSION, created_at, id);
+    escaped, APP_VERSION, created_at, id);
   free(escaped);
   return n >= 0 && (size_t)n < size;
 }
@@ -374,7 +384,7 @@ notify_v(const char *fmt, va_list ap) {
     logq("Rich notification not sent: cannot obtain timestamp");
     return;
   }
-  snprintf(id, sizeof id, "ps5save-%lld-%ld-%d-%u",
+  snprintf(id, sizeof id, "ps5savesbackup-%lld-%ld-%d-%u",
            (long long)ts.tv_sec, ts.tv_nsec, (int)getpid(), ++serial);
   payload = malloc(NOTIFICATION_JSON_SIZE);
   if(!payload) {
@@ -434,9 +444,10 @@ logq(const char *fmt, ...) {
   vsnprintf(msg, sizeof msg, fmt, ap);
   va_end(ap);
 
-  printf("%s\n", msg);
+  printf("[" APP_NAME "] %s\n", msg);
   fflush(stdout);
-  klog_printf("[backup] %s\n", msg);
+  klog_printf("[" APP_NAME "] %s\n", msg);
+  ui_log_push(msg);
 }
 
 
@@ -697,6 +708,14 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     stats->failed++;
     return;
   }
+
+#ifdef BACKUP_HOST_TEST
+  /* the host test can slow copying down to unplug the USB mid-pass */
+  const char *delay = getenv("TEST_COPY_DELAY_MS");
+  if(delay && atoi(delay) > 0) {
+    usleep((useconds_t)atoi(delay) * 1000);
+  }
+#endif
 
   tmp[0] = 0;
   if(snprintf(tmp, sizeof tmp, "%s.part", dst) >= (int)sizeof tmp) {
@@ -2186,10 +2205,7 @@ run_cycle(int pending_only) {
   g_pending_only = pending_only;
   g_cycle_deferred = 0;
   g_backup_busy = 0;
-  if(!g_start_notified) {
-    notify("Backup utility started");
-    g_start_notified = 1;
-  }
+  ui_set_state("backing up", "");
   memset(&stats, 0, sizeof stats);
   start = now_seconds();
 
@@ -2264,17 +2280,21 @@ run_cycle(int pending_only) {
            stats.failed, stats.copied);
       notify("Backup incomplete (%u failed).", stats.failed);
     }
+    ui_set_result("Backup incomplete (%u failed, %u copied)", stats.failed, stats.copied);
     g_last_failed = 1;
   } else if(stats.copied || (g_last_failed && !g_cycle_deferred)) {
     format_size(stats.bytes, size, sizeof size);
     logq("Successful backup (%s) done in %.1f seconds.", size,
          now_seconds() - start);
     notify("Backup complete (%s).", size);
+    ui_set_result("Backup complete (%s)", size);
     g_last_failed = 0;
   } else if(g_cycle_deferred) {
     logq("Backup pass finished; protected titles queued (%u files unchanged)", stats.unchanged);
+    ui_set_result("Protected titles queued (%u files unchanged)", stats.unchanged);
   } else {
     logq("Backup up to date (%u files unchanged)", stats.unchanged);
+    ui_set_result("Up to date (%u files unchanged)", stats.unchanged);
   }
 
   return 0;
@@ -2332,7 +2352,8 @@ acquire_lock(void) {
  * Wait on monotonic interval deadlines, with short checks for closed queued
  * titles. A close retry does not reset the next regular backup deadline.
  **/
-/* 0 = regular deadline, 1 = replacement requested, 2 = queued title closed. */
+/* 0 = regular deadline, 1 = replacement requested, 2 = queued title closed,
+ * 3 = the settings page asked for a pass. */
 static int
 wait_until(double due, int lock) {
   for(;;) {
@@ -2341,13 +2362,101 @@ wait_until(double due, int lock) {
     int slice = pending_titles ? CLOSE_POLL_SEC : SLICE_SEC;
     if(pending_ready()) return 2;
     int ms = remaining > slice ? slice * 1000 : (int)(remaining * 1000) + 1;
-    struct pollfd pfd = {lock, POLLIN, 0};
-    if(poll(&pfd, lock >= 0 ? 1 : 0, ms) > 0 && (pfd.revents & POLLIN)) {
-      int c = accept(lock, 0, 0);
-      if(c >= 0) close(c);
-      return 1;
+    struct pollfd pfd[2] = {{lock, POLLIN, 0}, {g_wake_pipe[0], POLLIN, 0}};
+    if(poll(pfd, 2, ms) > 0) {
+      if(pfd[0].revents & POLLIN) {
+        int c = accept(lock, 0, 0);
+        if(c >= 0) close(c);
+        return 1;
+      }
+      if(pfd[1].revents & POLLIN) {
+        char drain[16];
+        while(read(g_wake_pipe[0], drain, sizeof drain) == (ssize_t)sizeof drain) {}
+        return 3;
+      }
     }
   }
+}
+
+
+#include "settings.h"
+#include "web_ui.h"
+
+
+/**
+ * Where the settings come from and which USB holds the backups. With the
+ * internal settings file, the USB carrying the marker id from usb_id= is
+ * selected; without it, the legacy backup.conf on a USB. Returns 0 when
+ * backups can run, otherwise -1 with the reason in why.
+ **/
+static int
+source_select(char *why, size_t len) {
+  settings_t *s;
+  struct stat st;
+  int rc;
+
+  if(!stat(DATA_CONF, &st) && S_ISREG(st.st_mode)) {
+    g_legacy = 0;
+    snprintf(g_conf_path, sizeof g_conf_path, "%s", DATA_CONF);
+    if(!(s = settings_new())) {
+      snprintf(why, len, "Not enough memory.");
+      return -1;
+    }
+    settings_load(DATA_CONF, s);
+    if(!usb_id_valid(s->usb_id)) {
+      settings_free(s);
+      usb_clear();
+      ui_sync();
+      snprintf(why, len, "No backup USB selected: open the settings page.");
+      return -1;
+    }
+    rc = usb_select(s->usb_id);
+    settings_free(s);
+    ui_sync();
+    if(rc == -2) {
+      snprintf(why, len, "Backup USB %s is not writable.", g_usb_root);
+    } else if(rc < 0) {
+      snprintf(why, len, "The selected backup USB is not connected.");
+    }
+    return rc ? -1 : 0;
+  }
+
+  g_legacy = 1;
+  g_conf_path[0] = 0;
+  rc = usb_select(NULL);
+  if(rc == 0) {
+    snprintf(g_conf_path, sizeof g_conf_path, "%s/%s", g_usb_root, CONF_NAME);
+  }
+  ui_sync();
+  if(rc == -2) {
+    snprintf(why, len, "Backup USB %s is not writable.", g_usb_root);
+  } else if(rc < 0) {
+    snprintf(why, len, "No backup USB configured: open the settings page.");
+  }
+  return rc ? -1 : 0;
+}
+
+
+/* Did the settings page change where backups go since source_select()? */
+static int
+source_changed(void) {
+  settings_t *s;
+  struct stat st;
+  int changed;
+
+  if(stat(DATA_CONF, &st) || !S_ISREG(st.st_mode)) {
+    return !g_legacy;
+  }
+  if(g_legacy) {
+    return 1;
+  }
+  if(!(s = settings_new())) {
+    return 0;
+  }
+  settings_load(DATA_CONF, s);
+  changed = strcmp(s->usb_id, g_usb_id) != 0;
+  settings_free(s);
+  return changed;
 }
 
 
@@ -2376,10 +2485,12 @@ announce_daily(void) {
 int
 main(void) {
   int missing = 0;
+  int ready = 0;
   int lock;
-  double due, started;
+  double due = 0, started;
+  char why[192], last_why[192] = "", url[128];
 #ifdef BACKUP_HOST_TEST
-  int cycles = 1;
+  int cycles = 0, waits = 0;
   const char *max_cycles = getenv("TEST_CYCLES");
 #endif
 
@@ -2393,49 +2504,78 @@ main(void) {
     return EXIT_FAILURE;
   }
 
-  if(!(g_buf = malloc(COPY_BUF_SZ))) {
+  if(!(g_buf = malloc(COPY_BUF_SZ)) || pipe(g_wake_pipe)) {
     notify("Backup could not start: not enough memory.");
     return EXIT_FAILURE;
   }
 
-  /* Pick the USB partition that holds backup.conf. Without one, or with one
-   * that cannot be written to, nothing is backed up anywhere. */
-  switch(usb_select()) {
-  case 0:
-    break;
-  case -2:
-    notify("Backup could not start: USB %s is not writable.", g_usb_root);
-    return EXIT_FAILURE;
-  default:
-    notify("backup.conf not found on any USB.");
-    return EXIT_FAILURE;
-  }
-  logq("Starting backup service...");
-
-  /* Initial backup immediately; subsequent regular deadlines use monotonic time. */
-  started = now_seconds();
-  if(run_cycle(0) < 0) {
-    /* the USB was unplugged during the first pass: wait for the same USB to
-     * come back, exactly like a later pass would */
-    notify("USB %s unavailable: backup paused.", g_usb_root);
-    missing = MISSING_TRIES;
-    pending_retry_after = now_seconds() + SLICE_SEC * 3;
-    due = pending_retry_after;
+  web_url(url, sizeof url);
+  if(web_start()) {
+    logq("Settings page unavailable: port %d is busy", WEB_PORT);
+    notify("%s %s started (settings page unavailable).", APP_NAME, APP_VERSION);
   } else {
-    announce_daily();
-    due = next_due(started);
+    logq("Settings page: %s", url);
+    notify("%s %s started. Settings: %s", APP_NAME, APP_VERSION, url);
   }
+  ui_set_state("starting", "");
 
   for(;;) {
+    if(!ready) {
+      if(source_select(why, sizeof why) == 0) {
+        ready = 1;
+        missing = 0;
+        last_why[0] = 0;
+        logq("Starting backup service...");
+        ui_set_state("running", "");
+        due = now_seconds();
+      } else {
+        if(strcmp(why, last_why)) {
+          notify("%s", why);
+          snprintf(last_why, sizeof last_why, "%s", why);
+          if(!g_legacy || !g_usb_root[0]) {
+            static int opened;
+            struct stat st;
+            /* first run without any configuration: show the page right away */
+            if(!opened && stat(DATA_CONF, &st)) {
+              opened = 1;
+              web_open_browser(url);
+            }
+          }
+        }
+        ui_set_state("waiting", why);
+        ui_set_due(0);
+#ifdef BACKUP_HOST_TEST
+        if(max_cycles && ++waits > 2) {
+          return 2;
+        }
+#endif
+        if(wait_until(now_seconds() + SLICE_SEC * 3, lock) == 1) {
+          notify("Previous backup instance stopped.");
+          break;
+        }
+        continue;
+      }
+    }
+
 #ifdef BACKUP_HOST_TEST
     if(max_cycles && cycles >= atoi(max_cycles)) {
       return EXIT_SUCCESS;
     }
 #endif
+    ui_set_due(due);
     int wake = wait_until(due, lock);
     if(wake == 1) {
       notify("Previous backup instance stopped.");
       break;
+    }
+
+    /* the settings page may have moved the backups to another USB */
+    if(wake == 3 || wake == 0) {
+      if(source_changed()) {
+        logq("Backup destination changed in settings");
+        ready = 0;
+        continue;
+      }
     }
 
     started = now_seconds();
@@ -2445,6 +2585,8 @@ main(void) {
       if(++missing == MISSING_TRIES) {
         notify("USB %s unavailable: backup paused.", g_usb_root);
       }
+      ui_set_state("paused", "Backup USB unavailable");
+      ui_sync();
       pending_retry_after = now_seconds() + SLICE_SEC * 3;
       due = pending_retry_after;
       continue;
@@ -2454,10 +2596,12 @@ main(void) {
 #endif
 
     if(missing >= MISSING_TRIES) {
-      logq("backup.conf is back on %s", g_usb_root);
+      logq("Backup USB %s is back", g_usb_root);
       notify("USB %s is back: backup resumed.", g_usb_root);
     }
     announce_daily();
+    ui_set_state("running", "");
+    ui_sync();
     missing = 0;
     pending_retry_after = 0;
 

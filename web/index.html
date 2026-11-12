@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS5SavesBackup</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#2a2f3a; --fg:#e6e8ee; --dim:#9aa3b2; --ok:#3ddc84; --warn:#ffb648; --bad:#ff5c5c; --accent:#4c8dff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:18px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:20px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:14px; }
+  header h1 { margin:0; font-size:26px; }
+  header span { color:var(--dim); }
+  main { max-width:980px; margin:0 auto; padding:16px 24px 48px; display:grid; gap:18px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; }
+  h2 { margin:0 0 12px; font-size:20px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px 24px; align-items:center; }
+  .kv { color:var(--dim); } .kv b { color:var(--fg); font-weight:600; }
+  .state { display:inline-block; padding:2px 10px; border-radius:999px; font-weight:600; background:#2a2f3a; }
+  .state.running { background:#153d2a; color:var(--ok); } .state.backing { background:#1a3356; color:#8ab8ff; }
+  .state.waiting { background:#4a3a14; color:var(--warn); } .state.paused { background:#4a1d1d; color:var(--bad); }
+  label { display:block; margin:12px 0 4px; color:var(--dim); }
+  input[type=number], textarea { width:100%; background:#0f1115; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:10px 12px; font:inherit; }
+  input[type=number] { max-width:220px; }
+  textarea { min-height:180px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:16px; }
+  .check { display:flex; align-items:center; gap:10px; margin:10px 0; }
+  .check input { width:22px; height:22px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:12px 20px; font:inherit; font-weight:600; cursor:pointer; }
+  button.secondary { background:#2a2f3a; }
+  button:disabled { opacity:.5; cursor:default; }
+  .actions { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
+  .msg { margin-top:10px; min-height:1.4em; } .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; } td, th { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:500; } tr.sel td { color:var(--ok); }
+  pre { background:#0f1115; border:1px solid var(--line); border-radius:8px; padding:12px; max-height:320px; overflow:auto; font-size:14px; white-space:pre-wrap; margin:0; }
+  .hint { color:var(--dim); font-size:15px; margin:6px 0 0; }
+</style>
+</head>
+<body>
+<header><h1>PS5SavesBackup</h1><span id="version"></span></header>
+<main>
+  <section id="status">
+    <h2>Status</h2>
+    <div class="row">
+      <span class="state" id="state">...</span>
+      <span class="kv" id="reason"></span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="kv">Backup USB: <b id="usb">none</b></span>
+      <span class="kv">Free: <b id="free">-</b></span>
+      <span class="kv">Next pass: <b id="next">-</b></span>
+    </div>
+    <div class="row" style="margin-top:6px"><span class="kv">Last result: <b id="result">-</b></span></div>
+    <div class="row" style="margin-top:6px"><span class="kv">Settings file: <b id="conf">-</b></span></div>
+    <div class="actions">
+      <button id="backupNow" class="secondary">Back up now</button>
+    </div>
+  </section>
+
+  <section id="storage">
+    <h2>Backup USB</h2>
+    <table>
+      <thead><tr><th></th><th>Mount point</th><th>State</th><th>Free / total</th></tr></thead>
+      <tbody id="mounts"></tbody>
+    </table>
+    <p class="hint">Pick the partition that should hold the backups. A small file named <code>PS5SavesBackup.id</code> is written to it so it is found again whatever mount number it gets. Partitions without that file are never written to.</p>
+    <div class="actions"><button id="useUsb">Use selected partition</button></div>
+    <div class="msg" id="usbMsg"></div>
+  </section>
+
+  <section id="settings">
+    <h2>Settings</h2>
+    <form id="form">
+      <label for="interval">Delay between backup passes (seconds, 30–3600)</label>
+      <input type="number" id="interval" name="interval" min="30" max="3600" required>
+      <div class="check"><input type="checkbox" id="ps4" name="ps4"><label for="ps4" style="margin:0">Back up decrypted PS4 saves</label></div>
+      <div class="check"><input type="checkbox" id="ps5" name="ps5"><label for="ps5" style="margin:0">Back up decrypted PS5 saves</label></div>
+      <label for="max_mb">Maximum combined save size per title (MB, 64–65536)</label>
+      <input type="number" id="max_mb" name="max_mb" min="64" max="65536" required>
+      <label for="daily">Daily snapshots to keep (0–10, 0 = off)</label>
+      <input type="number" id="daily" name="daily" min="0" max="10" required>
+      <label for="paths">Files and folders to back up (one absolute path per line)</label>
+      <textarea id="paths" name="paths" spellcheck="false"></textarea>
+      <div class="actions">
+        <button type="submit" id="save">Save settings</button>
+        <button type="button" class="secondary" id="reload">Reload</button>
+      </div>
+      <div class="msg" id="formMsg"></div>
+    </form>
+  </section>
+
+  <section id="logsec">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function fmtBytes(n) {
+    if (!n && n !== 0) return '-';
+    var u = ['B', 'kB', 'MB', 'GB', 'TB'], i = 0;
+    while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+    return (i ? n.toFixed(1) : n) + ' ' + u[i];
+  }
+  function fmtAge(s) {
+    if (s < 0) return '';
+    if (s < 60) return s + ' s ago';
+    if (s < 3600) return Math.floor(s / 60) + ' min ago';
+    return Math.floor(s / 3600) + ' h ago';
+  }
+  function get(url) { return fetch(url, { cache: 'no-store' }).then(function (r) { return r.json(); }); }
+  function post(url, params) {
+    return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params ? params.toString() : '' }).then(function (r) { return r.json().then(function (j) { j.httpOk = r.ok; return j; }); });
+  }
+  function note(el, j) { el.textContent = j.ok || j.error || ''; el.className = 'msg ' + (j.httpOk ? 'ok' : 'bad'); }
+
+  function status() {
+    return get('/api/status').then(function (s) {
+      $('version').textContent = s.version;
+      var st = $('state'); st.textContent = s.state; st.className = 'state ' + s.state.split(' ')[0];
+      $('reason').textContent = s.reason;
+      $('usb').textContent = s.usb_root ? s.usb_root + (s.usb_lost ? ' (disconnected)' : '') : 'none';
+      $('free').textContent = s.usb_root && !s.usb_lost ? fmtBytes(s.usb_free) + ' of ' + fmtBytes(s.usb_total) : '-';
+      $('next').textContent = s.next_in >= 0 ? 'in ' + s.next_in + ' s' : '-';
+      $('result').textContent = s.result ? s.result + ' (' + fmtAge(s.result_age) + ')' : '-';
+      $('conf').textContent = s.conf_path ? s.conf_path + (s.legacy ? ' (legacy, on the USB; saving moves it to ' + s.settings_path + ')' : '') : s.settings_path + ' (not created yet)';
+    });
+  }
+  function mounts() {
+    return get('/api/usb').then(function (u) {
+      var tb = $('mounts'); tb.innerHTML = '';
+      u.mounts.forEach(function (m) {
+        var tr = document.createElement('tr');
+        var state = !m.mounted ? 'not mounted' : m.selected ? 'selected' : m.marker ? 'marked (other id)' : m.legacy_conf ? 'has backup.conf' : 'available';
+        if (m.selected) tr.className = 'sel';
+        tr.innerHTML = '<td>' + (m.mounted ? '<input type="radio" name="usb" value="' + m.root + '"' + (m.selected ? ' checked' : '') + '>' : '') + '</td>' +
+          '<td>' + m.root + '</td><td>' + state + '</td><td>' + (m.mounted ? fmtBytes(m.free) + ' / ' + fmtBytes(m.total) : '') + '</td>';
+        tb.appendChild(tr);
+      });
+      if (!u.mounts.length) tb.innerHTML = '<tr><td colspan="4">No USB mount points found</td></tr>';
+    });
+  }
+  function config() {
+    return get('/api/config').then(function (c) {
+      $('interval').value = c.interval; $('ps4').checked = c.ps4; $('ps5').checked = c.ps5;
+      $('max_mb').value = c.max_mb; $('daily').value = c.daily; $('paths').value = c.paths.join('\n');
+    });
+  }
+  function log() {
+    return get('/api/log').then(function (l) {
+      var pre = $('log'), atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+      pre.textContent = l.lines.join('\n');
+      if (atEnd) pre.scrollTop = pre.scrollHeight;
+    });
+  }
+
+  $('form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var p = new URLSearchParams();
+    p.set('interval', $('interval').value); p.set('max_mb', $('max_mb').value); p.set('daily', $('daily').value);
+    if ($('ps4').checked) p.set('ps4', 'on'); if ($('ps5').checked) p.set('ps5', 'on');
+    p.set('paths', $('paths').value);
+    $('save').disabled = true;
+    post('/api/config', p).then(function (j) { note($('formMsg'), j); return status().then(mounts); })
+      .catch(function (err) { note($('formMsg'), { error: String(err) }); })
+      .then(function () { $('save').disabled = false; });
+  });
+  $('reload').addEventListener('click', function () { config(); $('formMsg').textContent = ''; });
+  $('useUsb').addEventListener('click', function () {
+    var sel = document.querySelector('input[name=usb]:checked');
+    if (!sel) { note($('usbMsg'), { error: 'Select a mounted partition first' }); return; }
+    var p = new URLSearchParams(); p.set('root', sel.value);
+    $('useUsb').disabled = true;
+    post('/api/usb/select', p).then(function (j) { note($('usbMsg'), j); return new Promise(function (r) { setTimeout(r, 1500); }); })
+      .then(function () { return status().then(mounts).then(log); })
+      .catch(function (err) { note($('usbMsg'), { error: String(err) }); })
+      .then(function () { $('useUsb').disabled = false; });
+  });
+  $('backupNow').addEventListener('click', function () {
+    post('/api/backup').then(function () { setTimeout(function () { status(); log(); }, 1500); });
+  });
+
+  status().then(mounts).then(config).then(log);
+  setInterval(function () { status(); log(); }, 5000);
+  setInterval(mounts, 15000);
+})();
+</script>
+</body>
+</html>

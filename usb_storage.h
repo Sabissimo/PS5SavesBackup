@@ -1,11 +1,17 @@
 /* Runtime selection of the backup USB partition.
  *
- * The mount points /mnt/usb<N> are discovered at startup, sorted by N, and
- * the first one whose root holds a readable regular backup.conf is used for
- * the whole process: configuration, live backup, daily snapshots, change
- * cache and retention. Nothing is ever written to a mount point without a
- * backup.conf, there is no fallback to /mnt/usb0, and the selected mount
- * point is never exchanged for another one while the payload runs. */
+ * The mount points /mnt/usb<N> are discovered, sorted by N and checked in
+ * order. Two ways to recognise the backup partition:
+ *
+ *   - settings mode: the partition carries the marker file PS5SavesBackup.id
+ *     whose content equals usb_id= from the settings file. The marker is
+ *     written only when the user picks that partition on the settings page.
+ *   - legacy mode: no settings file exists and the partition root holds a
+ *     readable backup.conf (PS5Save v2 behaviour).
+ *
+ * Nothing is ever written to a mount point that was not recognised, there is
+ * no fallback to /mnt/usb0, and the selected mount point is only exchanged
+ * for another one when the user changes the selection in the settings. */
 #ifndef USB_STORAGE_H
 #define USB_STORAGE_H
 
@@ -16,17 +22,20 @@
 #define USB_PROBE_MAX   16         /* usb0..usb15 if USB_MOUNT_DIR is unreadable */
 #define MAX_USB_MOUNTS  64
 #define CONF_NAME       "backup.conf"
+#define MARKER_NAME     "PS5SavesBackup.id"
 #define BACKUP_DIR      "backup"
 #define DAILY_DIR       "backup_daily"
-#define USB_PROBE_NAME  ".ps5save-write-test"
+#define USB_PROBE_NAME  ".ps5savesbackup-write-test"
+#define USB_ID_LEN      32         /* hex characters in a marker id */
 #ifndef USB_CHECK_SEC
 #define USB_CHECK_SEC   1.0        /* how often presence is re-checked while copying */
 #endif
 
 static char g_usb_root[PATH_MAX];     /* e.g. /mnt/usb2; empty until selected */
-static char g_conf_path[PATH_MAX];    /* <usb>/backup.conf */
+static char g_conf_path[PATH_MAX];    /* settings file in use (internal or legacy USB) */
 static char g_backup_root[PATH_MAX];  /* <usb>/backup */
 static char g_daily_root[PATH_MAX];   /* <usb>/backup_daily */
+static char g_usb_id[USB_ID_LEN + 1]; /* marker id the USB was selected by ("" = legacy) */
 static dev_t g_usb_dev;               /* identity of the selected mount */
 static ino_t g_usb_ino;
 static int g_usb_lost;                /* selected USB disappeared; stop writing */
@@ -77,8 +86,6 @@ usb_list_mounts(usb_mount_t *mounts, int max) {
   DIR *dir;
 
   if(!(dir = opendir(USB_MOUNT_DIR))) {
-    logq("Cannot list %s (%s); probing %s0..%s%d", USB_MOUNT_DIR, strerror(errno),
-         USB_NAME_PREFIX, USB_NAME_PREFIX, USB_PROBE_MAX - 1);
     for(int i = 0; i < USB_PROBE_MAX && n < max; i++, n++) {
       snprintf(mounts[n].name, sizeof mounts[n].name, "%s%d", USB_NAME_PREFIX, i);
       mounts[n].number = (unsigned long)i;
@@ -105,45 +112,92 @@ usb_list_mounts(usb_mount_t *mounts, int max) {
 }
 
 
-/* A mount point is only usable if it is a directory with a file system of
- * its own (an unmounted /mnt/usbN is a plain folder on internal storage) and
- * backup.conf in its root is a readable regular file. A host test with plain
- * directories (BACKUP_HOST_TEST) skips the mount check. */
+/* A usable mount point is a directory with a file system of its own: an
+ * unmounted /mnt/usbN is a plain folder on internal storage. A host test
+ * with plain directories (BACKUP_HOST_TEST) skips the mount check. */
 static int
-usb_conf_present(const char *root, const struct stat *parent, struct stat *st) {
-  char conf[PATH_MAX];
-  struct stat cs;
-  int fd;
-
+usb_root_mounted(const char *root, const struct stat *parent, struct stat *st) {
   if(stat(root, st) || !S_ISDIR(st->st_mode)) {
-    logq("Checking %s ... not accessible", root);
     return 0;
   }
 #ifndef BACKUP_HOST_TEST
   if(parent && st->st_dev == parent->st_dev) {
-    logq("Checking %s ... not mounted", root);
     return 0;
   }
 #else
   (void)parent;
 #endif
-  if(snprintf(conf, sizeof conf, "%s/%s", root, CONF_NAME) >= (int)sizeof conf) {
+  return 1;
+}
+
+
+/* Reads a small text file below root into buf (first line, trimmed).
+ * Returns 1 if the file is a readable regular file. */
+static int
+usb_read_small(const char *root, const char *name, char *buf, size_t len) {
+  char path[PATH_MAX];
+  struct stat st;
+  ssize_t n;
+  int fd;
+
+  if(snprintf(path, sizeof path, "%s/%s", root, name) >= (int)sizeof path) {
     return 0;
   }
-  if(stat(conf, &cs)) {
-    logq("Checking %s ... NOT FOUND", conf);
+  if(stat(path, &st) || !S_ISREG(st.st_mode)) {
     return 0;
   }
-  if(!S_ISREG(cs.st_mode)) {
-    logq("Checking %s ... not a regular file", conf);
+  if((fd = open(path, O_RDONLY)) < 0) {
     return 0;
   }
-  if((fd = open(conf, O_RDONLY)) < 0) {
-    logq("Checking %s ... not readable (%s)", conf, strerror(errno));
-    return 0;
-  }
+  n = read(fd, buf, len - 1);
   close(fd);
-  logq("Checking %s ... FOUND", conf);
+  if(n < 0) {
+    return 0;
+  }
+  buf[n] = 0;
+  buf[strcspn(buf, "\r\n")] = 0;
+  return 1;
+}
+
+
+/* Exactly USB_ID_LEN lowercase hex characters. */
+static int
+usb_id_valid(const char *id) {
+  if(strlen(id) != USB_ID_LEN) {
+    return 0;
+  }
+  for(const char *p = id; *p; p++) {
+    if(!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+/* Does this mount point belong to us? Settings mode compares the marker id,
+ * legacy mode looks for a readable backup.conf. Logs the verdict. */
+static int
+usb_root_matches(const char *root, const char *usb_id) {
+  char content[128];
+
+  if(usb_id) {
+    if(!usb_read_small(root, MARKER_NAME, content, sizeof content)) {
+      logq("Checking %s/%s ... NOT FOUND", root, MARKER_NAME);
+      return 0;
+    }
+    if(strcmp(content, usb_id)) {
+      logq("Checking %s/%s ... another id", root, MARKER_NAME);
+      return 0;
+    }
+    logq("Checking %s/%s ... FOUND", root, MARKER_NAME);
+    return 1;
+  }
+  if(!usb_read_small(root, CONF_NAME, content, sizeof content)) {
+    logq("Checking %s/%s ... NOT FOUND", root, CONF_NAME);
+    return 0;
+  }
+  logq("Checking %s/%s ... FOUND", root, CONF_NAME);
   return 1;
 }
 
@@ -184,18 +238,28 @@ usb_writable(void) {
 }
 
 
+static void
+usb_clear(void) {
+  g_usb_root[0] = g_backup_root[0] = g_daily_root[0] = g_usb_id[0] = 0;
+  g_usb_dev = 0;
+  g_usb_ino = 0;
+  g_usb_lost = 0;
+}
+
+
 /**
  * Scan the USB mount points in numerical order and select the first one
- * that holds backup.conf. Returns 0 on success, -1 if no configuration was
- * found anywhere, -2 if the selected USB cannot be written to (g_usb_root
- * then names it, for the error report).
+ * that matches: the marker id when usb_id is given, backup.conf otherwise.
+ * Returns 0 on success, -1 if nothing matched, -2 if the matching USB cannot
+ * be written to (g_usb_root then names it, for the error report).
  **/
 static int
-usb_select(void) {
+usb_select(const char *usb_id) {
   usb_mount_t mounts[MAX_USB_MOUNTS];
   struct stat parent, st;
   int n;
 
+  usb_clear();
   logq("Scanning USB devices...");
   if(stat(USB_MOUNT_DIR, &parent)) {
     memset(&parent, 0, sizeof parent);
@@ -213,14 +277,18 @@ usb_select(void) {
       continue;
     }
     logq("Checking %s", root);
-    if(!usb_conf_present(root, &parent, &st)) {
+    if(!usb_root_mounted(root, &parent, &st)) {
+      logq("Checking %s ... not mounted", root);
       continue;
     }
-    logq("Found %s", CONF_NAME);
+    if(!usb_root_matches(root, usb_id)) {
+      continue;
+    }
+    logq("Found %s", usb_id ? MARKER_NAME : CONF_NAME);
     snprintf(g_usb_root, sizeof g_usb_root, "%s", root);
-    snprintf(g_conf_path, sizeof g_conf_path, "%s/%s", root, CONF_NAME);
     snprintf(g_backup_root, sizeof g_backup_root, "%s/%s", root, BACKUP_DIR);
     snprintf(g_daily_root, sizeof g_daily_root, "%s/%s", root, DAILY_DIR);
+    snprintf(g_usb_id, sizeof g_usb_id, "%s", usb_id ? usb_id : "");
     g_usb_dev = st.st_dev;
     g_usb_ino = st.st_ino;
     g_usb_lost = 0;
@@ -232,26 +300,34 @@ usb_select(void) {
     return 0;
   }
 
-  logq("No %s found on any USB device (%d mount point(s) checked)", CONF_NAME, n);
+  if(usb_id) {
+    logq("No USB with %s id %.8s... connected (%d mount point(s) checked)",
+         MARKER_NAME, usb_id, n);
+  } else {
+    logq("No %s found on any USB device (%d mount point(s) checked)", CONF_NAME, n);
+  }
   return -1;
 }
 
 
 /**
  * Is the selected USB still there? The mount point must still be the same
- * file system and still hold backup.conf. Once it is gone, every copy loop
- * stops at its next check; the loss is logged once.
+ * file system and still hold its marker (or backup.conf in legacy mode).
+ * Once it is gone, every copy loop stops at its next check; the loss is
+ * logged once.
  **/
 static int
 usb_online(void) {
-  struct stat st, cs;
+  struct stat st;
+  char content[128];
 
   if(!g_usb_root[0]) {
     return 0;
   }
   if(stat(g_usb_root, &st) || !S_ISDIR(st.st_mode) ||
      st.st_dev != g_usb_dev || st.st_ino != g_usb_ino ||
-     stat(g_conf_path, &cs) || !S_ISREG(cs.st_mode)) {
+     !usb_read_small(g_usb_root, g_usb_id[0] ? MARKER_NAME : CONF_NAME,
+                     content, sizeof content)) {
     if(!g_usb_lost) {
       logq("USB %s is no longer available; stopping writes", g_usb_root);
     }
@@ -282,7 +358,7 @@ usb_watch(void) {
 /**
  * Called at the start of every backup pass. The same mount point is checked
  * again (after rest mode the drive may have been re-mounted, which changes
- * its file system identity); another mount point is never considered.
+ * its file system identity); another mount point is never considered here.
  **/
 static int
 usb_cycle_begin(void) {
@@ -294,11 +370,7 @@ usb_cycle_begin(void) {
   if(stat(USB_MOUNT_DIR, &parent)) {
     memset(&parent, 0, sizeof parent);
   }
-  if(stat(g_usb_root, &st) || !S_ISDIR(st.st_mode)
-#ifndef BACKUP_HOST_TEST
-     || st.st_dev == parent.st_dev
-#endif
-     ) {
+  if(!usb_root_mounted(g_usb_root, &parent, &st)) {
     if(!g_usb_lost) {
       logq("USB %s is no longer available; stopping writes", g_usb_root);
     }
@@ -306,8 +378,10 @@ usb_cycle_begin(void) {
     return 0;
   }
   if(st.st_dev != g_usb_dev || st.st_ino != g_usb_ino) {
-    struct stat cs;
-    if(stat(g_conf_path, &cs) || !S_ISREG(cs.st_mode)) {
+    char content[128];
+    const char *name = g_usb_id[0] ? MARKER_NAME : CONF_NAME;
+    if(!usb_read_small(g_usb_root, name, content, sizeof content) ||
+       (g_usb_id[0] && strcmp(content, g_usb_id))) {
       if(!g_usb_lost) {
         logq("USB %s is no longer available; stopping writes", g_usb_root);
       }

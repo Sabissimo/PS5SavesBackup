@@ -1,0 +1,5 @@
+# Build output
+ps5savesbackup.elf
+backup.elf
+tests/host/ps5savesbackup_host
+tests/run/
